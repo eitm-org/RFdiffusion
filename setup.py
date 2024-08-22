@@ -6,4 +6,4 @@ setup(name='rfdiffusion',
       author='Rosetta Commons',
       url='https://github.com/RosettaCommons/RFdiffusion',
       packages=find_packages(),
-      install_requires=['torch', 'equivariant-attention'])
+      install_requires=['torch', 'se3-transformer'])
