@@ -502,17 +502,17 @@ class Denoise:
 
 
 def sampler_selector(conf: DictConfig):
-    if conf.rfdiffusionscaffoldguided.scaffoldguided:
+    if conf.rfdiffusion.scaffoldguided.scaffoldguided:
         sampler = model_runners.ScaffoldedSampler(conf)
     else:
-        if conf.rfdiffusioninference.model_runner == "default":
+        if conf.rfdiffusion.inference.model_runner == "default":
             sampler = model_runners.Sampler(conf)
-        elif conf.rfdiffusioninference.model_runner == "SelfConditioning":
+        elif conf.rfdiffusion.inference.model_runner == "SelfConditioning":
             sampler = model_runners.SelfConditioning(conf)
-        elif conf.rfdiffusioninference.model_runner == "ScaffoldedSampler":
+        elif conf.rfdiffusion.inference.model_runner == "ScaffoldedSampler":
             sampler = model_runners.ScaffoldedSampler(conf)
         else:
-            raise ValueError(f"Unrecognized sampler {conf.rfdiffusionmodel_runner}")
+            raise ValueError(f"Unrecognized sampler {conf.rfdiffusion.model_runner}")
     return sampler
 
 
@@ -648,11 +648,11 @@ def get_idx0_hotspots(mappings, ppi_conf, binderlen):
 
     hotspot_idx = None
     if binderlen > 0:
-        if ppi_conf.rfdiffusionhotspot_res is not None:
+        if ppi_conf.rfdiffusion.hotspot_res is not None:
             assert all(
-                [i[0].isalpha() for i in ppi_conf.rfdiffusionhotspot_res]
+                [i[0].isalpha() for i in ppi_conf.rfdiffusion.hotspot_res]
             ), "Hotspot residues need to be provided in pdb-indexed form. E.g. A100,A103"
-            hotspots = [(i[0], int(i[1:])) for i in ppi_conf.rfdiffusionhotspot_res]
+            hotspots = [(i[0], int(i[1:])) for i in ppi_conf.rfdiffusion.hotspot_res]
             hotspot_idx = []
             for i, res in enumerate(mappings["receptor_con_ref_pdb_idx"]):
                 if res in hotspots:
@@ -685,19 +685,19 @@ class BlockAdjacency:
         """
         Parameters:
           inputs:
-             conf.rfdiffusionscaffold_list as conf
-             conf.rfdiffusioninference.num_designs for sanity checking
+             conf.rfdiffusion.scaffold_list as conf
+             conf.rfdiffusion.inference.num_designs for sanity checking
         """
        
         self.conf=conf 
         # either list or path to .txt file with list of scaffolds
-        if self.conf.rfdiffusionscaffoldguided.scaffold_list is not None:
-            if type(self.conf.rfdiffusionscaffoldguided.scaffold_list) == list:
+        if self.conf.rfdiffusion.scaffoldguided.scaffold_list is not None:
+            if type(self.conf.rfdiffusion.scaffoldguided.scaffold_list) == list:
                 self.scaffold_list = scaffold_list
-            elif self.conf.rfdiffusionscaffoldguided.scaffold_list[-4:] == ".txt":
+            elif self.conf.rfdiffusion.scaffoldguided.scaffold_list[-4:] == ".txt":
                 # txt file with list of ids
                 list_from_file = []
-                with open(self.conf.rfdiffusionscaffoldguided.scaffold_list, "r") as f:
+                with open(self.conf.rfdiffusion.scaffoldguided.scaffold_list, "r") as f:
                     for line in f:
                         list_from_file.append(line.strip())
                 self.scaffold_list = list_from_file
@@ -706,45 +706,45 @@ class BlockAdjacency:
         else:
             self.scaffold_list = [
                 os.path.split(i)[1][:-6]
-                for i in glob.glob(f"{self.conf.rfdiffusionscaffoldguided.scaffold_dir}/*_ss.pt")
+                for i in glob.glob(f"{self.conf.rfdiffusion.scaffoldguided.scaffold_dir}/*_ss.pt")
             ]
             self.scaffold_list.sort()
 
         # path to directory with scaffolds, ss files and block_adjacency files
-        self.scaffold_dir = self.conf.rfdiffusionscaffoldguided.scaffold_dir
+        self.scaffold_dir = self.conf.rfdiffusion.scaffoldguided.scaffold_dir
 
         # maximum sampled insertion in each loop segment
-        if "-" in str(self.conf.rfdiffusionscaffoldguided.sampled_insertion):
+        if "-" in str(self.conf.rfdiffusion.scaffoldguided.sampled_insertion):
             self.sampled_insertion = [
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_insertion).split("-")[0]),
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_insertion).split("-")[1]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_insertion).split("-")[0]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_insertion).split("-")[1]),
             ]
         else:
-            self.sampled_insertion = [0, int(self.conf.rfdiffusionscaffoldguided.sampled_insertion)]
+            self.sampled_insertion = [0, int(self.conf.rfdiffusion.scaffoldguided.sampled_insertion)]
 
         # maximum sampled insertion at N- and C-terminus
-        if "-" in str(self.conf.rfdiffusionscaffoldguided.sampled_N):
+        if "-" in str(self.conf.rfdiffusion.scaffoldguided.sampled_N):
             self.sampled_N = [
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_N).split("-")[0]),
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_N).split("-")[1]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_N).split("-")[0]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_N).split("-")[1]),
             ]
         else:
-            self.sampled_N = [0, int(self.conf.rfdiffusionscaffoldguided.sampled_N)]
-        if "-" in str(self.conf.rfdiffusionscaffoldguided.sampled_C):
+            self.sampled_N = [0, int(self.conf.rfdiffusion.scaffoldguided.sampled_N)]
+        if "-" in str(self.conf.rfdiffusion.scaffoldguided.sampled_C):
             self.sampled_C = [
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_C).split("-")[0]),
-                int(str(self.conf.rfdiffusionscaffoldguided.sampled_C).split("-")[1]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_C).split("-")[0]),
+                int(str(self.conf.rfdiffusion.scaffoldguided.sampled_C).split("-")[1]),
             ]
         else:
-            self.sampled_C = [0, int(self.conf.rfdiffusionscaffoldguided.sampled_C)]
+            self.sampled_C = [0, int(self.conf.rfdiffusion.scaffoldguided.sampled_C)]
 
         # number of residues to mask ss identity of in H/E regions (from junction)
         # e.g. if ss_mask = 2, L,L,L,H,H,H,H,H,H,H,L,L,E,E,E,E,E,E,L,L,L,L,L,L would become\
         # M,M,M,M,M,H,H,H,M,M,M,M,M,M,E,E,M,M,M,M,M,M,M,M where M is mask
-        self.ss_mask = self.conf.rfdiffusionscaffoldguided.ss_mask
+        self.ss_mask = self.conf.rfdiffusion.scaffoldguided.ss_mask
 
         # whether or not to work systematically through the list
-        self.systematic = self.conf.rfdiffusionscaffoldguided.systematic
+        self.systematic = self.conf.rfdiffusion.scaffoldguided.systematic
 
         self.num_designs = num_designs
 
@@ -759,10 +759,10 @@ class BlockAdjacency:
             self.item_n = 0
 
         # whether to mask loops or not
-        if not self.conf.rfdiffusionscaffoldguided.mask_loops:
-            assert self.conf.rfdiffusionscaffoldguided.sampled_N == 0, "can't add length if not masking loops"
-            assert self.conf.rfdiffusionscaffoldguided.sampled_C == 0, "can't add lemgth if not masking loops"
-            assert self.conf.rfdiffusionscaffoldguided.sampled_insertion == 0, "can't add length if not masking loops"
+        if not self.conf.rfdiffusion.scaffoldguided.mask_loops:
+            assert self.conf.rfdiffusion.scaffoldguided.sampled_N == 0, "can't add length if not masking loops"
+            assert self.conf.rfdiffusion.scaffoldguided.sampled_C == 0, "can't add lemgth if not masking loops"
+            assert self.conf.rfdiffusion.scaffoldguided.sampled_insertion == 0, "can't add length if not masking loops"
             self.mask_loops = False
         else:
             self.mask_loops = True
@@ -876,7 +876,7 @@ class BlockAdjacency:
         """
         
         # Handle determinism. Useful for integration tests
-        if self.conf.rfdiffusioninference.deterministic:
+        if self.conf.rfdiffusion.inference.deterministic:
             torch.manual_seed(self.num_completed)
             np.random.seed(self.num_completed)
             random.seed(self.num_completed)
@@ -924,7 +924,7 @@ class Target:
     """
 
     def __init__(self, conf: DictConfig, hotspots=None):
-        self.pdb = parse_pdb(conf.rfdiffusiontarget_path)
+        self.pdb = parse_pdb(conf.rfdiffusion.target_path)
 
         if hotspots is not None:
             self.hotspots = hotspots
@@ -937,8 +937,8 @@ class Target:
             ]
         )
 
-        if conf.rfdiffusioncontig_crop:
-            self.contig_crop(conf.rfdiffusioncontig_crop)
+        if conf.rfdiffusion.contig_crop:
+            self.contig_crop(conf.rfdiffusion.contig_crop)
 
     def parse_contig(self, contig_crop):
         """
