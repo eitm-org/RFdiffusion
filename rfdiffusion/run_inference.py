@@ -2,7 +2,7 @@
 """
 Inference script callable as a function.
 
-To call as a function, provide configuration parameters directly.
+To call as a function, provide a configuration file.
 """
 
 import re
@@ -25,15 +25,26 @@ def make_deterministic(seed=0):
     random.seed(seed)
 
 def run_inference(
-    config_package,  # Package containing config files
-    config_name="base.yaml",
-    deterministic=False,
-    design_startnum=-1,
-    num_designs=1,
-    cautious=False,
-    write_trajectory=False
+    config_file,  # Path to the YAML configuration file
+    config_package="salt"  # Optional: Package containing the configuration file
 ):
     log = logging.getLogger(__name__)
+    
+    # Load configuration
+    if config_package:
+        with pkg_resources.path(config_package, config_file) as config_path:
+            conf = OmegaConf.load(config_path)
+    else:
+        conf = OmegaConf.load(config_file)
+
+    # Extract relevant configuration sections
+    inf_conf = conf.rfdiffusion.inference
+    num_designs = inf_conf.num_designs
+    design_startnum = inf_conf.design_startnum
+    cautious = inf_conf.cautious
+    write_trajectory = inf_conf.write_trajectory
+    deterministic = inf_conf.deterministic
+
     if deterministic:
         make_deterministic()
 
@@ -45,10 +56,6 @@ def run_inference(
         log.info("////////////////////////////////////////////////")
         log.info("///// NO GPU DETECTED! Falling back to CPU /////")
         log.info("////////////////////////////////////////////////")
-
-    # Load configuration from package resources
-    with pkg_resources.path(config_package, config_name) as config_path:
-        conf = OmegaConf.load(config_path)
 
     # Initialize sampler and target/contig.
     sampler = iu.sampler_selector(conf)
@@ -185,3 +192,7 @@ def run_inference(
             )
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
+
+# Example call from a Jupyter notebook
+# import mypackage  # Replace with the name of your package
+# run_inference(config_file='path/to/your/config.yaml')
