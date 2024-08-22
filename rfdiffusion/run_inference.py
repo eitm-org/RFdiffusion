@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 """
-Inference script without hydra.
+Inference script callable as a function.
+
+To call as a function, provide configuration parameters directly.
 """
 
 import re
-import os, time, pickle
+import os
+import time
+import pickle
 import torch
 from omegaconf import OmegaConf
 import logging
@@ -13,17 +17,27 @@ from rfdiffusion.inference import utils as iu
 import numpy as np
 import random
 import glob
+import importlib.resources as pkg_resources
 
 def make_deterministic(seed=0):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-def main(conf) -> None:
+def run_inference(
+    config_package,  # Package containing config files
+    config_name="base.yaml",
+    deterministic=False,
+    design_startnum=-1,
+    num_designs=1,
+    cautious=False,
+    write_trajectory=False
+):
     log = logging.getLogger(__name__)
-    if conf['inference']['deterministic']:
+    if deterministic:
         make_deterministic()
 
+    # Check for available GPU and print result of check
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
         log.info(f"Found GPU with device_name {device_name}. Will run RFdiffusion on {device_name}")
@@ -32,14 +46,15 @@ def main(conf) -> None:
         log.info("///// NO GPU DETECTED! Falling back to CPU /////")
         log.info("////////////////////////////////////////////////")
 
-    # Convert to DictConfig if needed
-    conf = OmegaConf.create(conf)
+    # Load configuration from package resources
+    with pkg_resources.path(config_package, config_name) as config_path:
+        conf = OmegaConf.load(config_path)
 
     # Initialize sampler and target/contig.
     sampler = iu.sampler_selector(conf)
 
-    design_startnum = sampler.inf_conf.design_startnum
-    if sampler.inf_conf.design_startnum == -1:
+    # Loop over number of designs to sample.
+    if design_startnum == -1:
         existing = glob.glob(sampler.inf_conf.output_prefix + "*.pdb")
         indices = [-1]
         for e in existing:
@@ -50,14 +65,14 @@ def main(conf) -> None:
             indices.append(int(m))
         design_startnum = max(indices) + 1
 
-    for i_des in range(design_startnum, design_startnum + sampler.inf_conf.num_designs):
-        if conf['inference']['deterministic']:
+    for i_des in range(design_startnum, design_startnum + num_designs):
+        if deterministic:
             make_deterministic(i_des)
 
         start_time = time.time()
         out_prefix = f"{sampler.inf_conf.output_prefix}_{i_des}"
         log.info(f"Making design {out_prefix}")
-        if sampler.inf_conf.cautious and os.path.exists(out_prefix + ".pdb"):
+        if cautious and os.path.exists(out_prefix + ".pdb"):
             log.info(
                 f"(cautious mode) Skipping this design because {out_prefix}.pdb already exists."
             )
@@ -71,6 +86,7 @@ def main(conf) -> None:
 
         x_t = torch.clone(x_init)
         seq_t = torch.clone(seq_init)
+        # Loop over number of reverse diffusion time steps.
         for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step - 1, -1):
             px0, x_t, seq_t, plddt = sampler.sample_step(
                 t=t, x_t=x_t, seq_init=seq_t, final_step=sampler.inf_conf.final_step
@@ -78,8 +94,9 @@ def main(conf) -> None:
             px0_xyz_stack.append(px0)
             denoised_xyz_stack.append(x_t)
             seq_stack.append(seq_t)
-            plddt_stack.append(plddt[0])
+            plddt_stack.append(plddt[0])  # remove singleton leading dimension
 
+        # Flip order for better visualization in pymol
         denoised_xyz_stack = torch.stack(denoised_xyz_stack)
         denoised_xyz_stack = torch.flip(
             denoised_xyz_stack,
@@ -94,19 +111,26 @@ def main(conf) -> None:
                 0,
             ],
         )
+
+        # For logging -- don't flip
         plddt_stack = torch.stack(plddt_stack)
 
+        # Save outputs
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
         final_seq = seq_stack[-1]
 
+        # Output glycines, except for motif region
         final_seq = torch.where(
             torch.argmax(seq_init, dim=-1) == 21, 7, torch.argmax(seq_init, dim=-1)
-        )
+        )  # 7 is glycine
 
         bfacts = torch.ones_like(final_seq.squeeze())
+        # make bfact=0 for diffused coordinates
         bfacts[torch.where(torch.argmax(seq_init, dim=-1) == 21, True, False)] = 0
+        # pX0 last step
         out = f"{out_prefix}.pdb"
 
+        # Now don't output sidechains
         writepdb(
             out,
             denoised_xyz_stack[0, :, :4],
@@ -116,6 +140,7 @@ def main(conf) -> None:
             bfacts=bfacts,
         )
 
+        # run metadata
         trb = dict(
             config=OmegaConf.to_container(sampler._conf, resolve=True),
             plddt=plddt_stack.cpu().numpy(),
@@ -130,7 +155,8 @@ def main(conf) -> None:
         with open(f"{out_prefix}.trb", "wb") as f_out:
             pickle.dump(trb, f_out)
 
-        if sampler.inf_conf.write_trajectory:
+        if write_trajectory:
+            # trajectory pdbs
             traj_prefix = (
                 os.path.dirname(out_prefix) + "/traj/" + os.path.basename(out_prefix)
             )
@@ -159,21 +185,3 @@ def main(conf) -> None:
             )
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
-
-if __name__ == "__main__":
-    config_dict = {
-        'inference': {
-            'deterministic': True,
-            'num_designs': 10,
-            'output_prefix': 'test_outputs/test',
-            'cautious': False,
-            'final_step': 10,
-            'write_trajectory': True
-        },
-        'scaffoldguided': {
-            'scaffoldguided': False
-        },
-        'other_params': '...'
-    }
-    config = OmegaConf.create(config_dict)
-    main(config)
