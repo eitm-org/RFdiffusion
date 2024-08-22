@@ -7,7 +7,6 @@ import torch.nn as nn
 
 from rfdiffusion.util_module import init_lecun_normal_param
 import importlib  
-se3transformer = importlib.import_module("equivariant-attention")
 from se3transformer.model import SE3Transformer
 from se3transformer.model.fiber import Fiber
 
