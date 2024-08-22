@@ -27,6 +27,7 @@ from hydra.core.hydra_config import HydraConfig
 import numpy as np
 import random
 import glob
+import sys
 
 
 def make_deterministic(seed=0):
@@ -188,6 +189,14 @@ def main(conf: HydraConfig) -> None:
             )
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
+
+
+def run_inference_with_args(args):
+    # Mock the command-line arguments
+    sys.argv = args
+
+    # Call the main function
+    main()
 
 
 if __name__ == "__main__":
