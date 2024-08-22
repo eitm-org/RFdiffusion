@@ -25,17 +25,12 @@ def make_deterministic(seed=0):
     random.seed(seed)
 
 def run_inference(
-    config_file,  # Path to the YAML configuration file
-    config_package="salt"  # Optional: Package containing the configuration file
+    config_file=None  # Path to the YAML configuration file
 ):
     log = logging.getLogger(__name__)
     
     # Load configuration
-    if config_package:
-        with pkg_resources.path(config_package, config_file) as config_path:
-            conf = OmegaConf.load(config_path)
-    else:
-        conf = OmegaConf.load(config_file)
+    conf = OmegaConf.load(config_file)
 
     # Extract relevant configuration sections
     inf_conf = conf.rfdiffusion.inference
@@ -192,7 +187,3 @@ def run_inference(
             )
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
-
-# Example call from a Jupyter notebook
-# import mypackage  # Replace with the name of your package
-# run_inference(config_file='path/to/your/config.yaml')
