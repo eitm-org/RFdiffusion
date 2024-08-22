@@ -6,8 +6,8 @@ import torch.nn as nn
 #from equivariant_attention.fibers import Fiber
 
 from rfdiffusion.util_module import init_lecun_normal_param
-from se3_transformer.model import SE3Transformer
-from se3_transformer.model.fiber import Fiber
+from equivariant-transformer.model import SE3Transformer
+from equivariant-transformer.model.fiber import Fiber
 
 class SE3TransformerWrapper(nn.Module):
     """SE(3) equivariant GCN with attention"""
