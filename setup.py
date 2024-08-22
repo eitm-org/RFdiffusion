@@ -7,4 +7,4 @@ setup(name='rfdiffusion',
       url='https://github.com/RosettaCommons/RFdiffusion',
       scripts=["scripts/run_inference.py"],
       packages=find_packages(),
-      install_requires=['torch', 'se3-transformer'])
+      install_requires=['torch', 'equivariant-attention'])
