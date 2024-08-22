@@ -5,6 +5,5 @@ setup(name='rfdiffusion',
       description='RFdiffusion is an open source method for protein structure generation.',
       author='Rosetta Commons',
       url='https://github.com/RosettaCommons/RFdiffusion',
-      scripts=["scripts/run_inference.py"],
       packages=find_packages(),
       install_requires=['torch', 'equivariant-attention'])
