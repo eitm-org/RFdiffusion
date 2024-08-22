@@ -2,44 +2,29 @@
 """
 Inference script.
 
-To run with base.yaml as the config,
-
+To run with default configuration,
 > python run_inference.py
-
-To specify a different config,
-
-> python run_inference.py --config-name symmetry
-
-where symmetry can be the filename of any other config (without .yaml extension)
-See https://hydra.cc/docs/advanced/hydra-command-line-flags/ for more options.
-
 """
 
 import re
 import os, time, pickle
 import torch
 from omegaconf import OmegaConf
-import hydra
 import logging
 from rfdiffusion.util import writepdb_multi, writepdb
 from rfdiffusion.inference import utils as iu
-from hydra.core.hydra_config import HydraConfig
 import numpy as np
 import random
 import glob
-import sys
-
 
 def make_deterministic(seed=0):
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-
-@hydra.main(version_base=None, config_path="../config/inference", config_name="base")
-def main(conf: HydraConfig) -> None:
+def main(conf) -> None:
     log = logging.getLogger(__name__)
-    if conf.inference.deterministic:
+    if conf['inference']['deterministic']:
         make_deterministic()
 
     # Check for available GPU and print result of check
@@ -70,7 +55,7 @@ def main(conf: HydraConfig) -> None:
         design_startnum = max(indices) + 1
 
     for i_des in range(design_startnum, design_startnum + sampler.inf_conf.num_designs):
-        if conf.inference.deterministic:
+        if conf['inference']['deterministic']:
             make_deterministic(i_des)
 
         start_time = time.time()
@@ -90,7 +75,6 @@ def main(conf: HydraConfig) -> None:
 
         x_t = torch.clone(x_init)
         seq_t = torch.clone(seq_init)
-        # Loop over number of reverse diffusion time steps.
         for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step - 1, -1):
             px0, x_t, seq_t, plddt = sampler.sample_step(
                 t=t, x_t=x_t, seq_init=seq_t, final_step=sampler.inf_conf.final_step
@@ -98,9 +82,8 @@ def main(conf: HydraConfig) -> None:
             px0_xyz_stack.append(px0)
             denoised_xyz_stack.append(x_t)
             seq_stack.append(seq_t)
-            plddt_stack.append(plddt[0])  # remove singleton leading dimension
+            plddt_stack.append(plddt[0])
 
-        # Flip order for better visualization in pymol
         denoised_xyz_stack = torch.stack(denoised_xyz_stack)
         denoised_xyz_stack = torch.flip(
             denoised_xyz_stack,
@@ -115,26 +98,19 @@ def main(conf: HydraConfig) -> None:
                 0,
             ],
         )
-
-        # For logging -- don't flip
         plddt_stack = torch.stack(plddt_stack)
 
-        # Save outputs
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
         final_seq = seq_stack[-1]
 
-        # Output glycines, except for motif region
         final_seq = torch.where(
             torch.argmax(seq_init, dim=-1) == 21, 7, torch.argmax(seq_init, dim=-1)
-        )  # 7 is glycine
+        )
 
         bfacts = torch.ones_like(final_seq.squeeze())
-        # make bfact=0 for diffused coordinates
         bfacts[torch.where(torch.argmax(seq_init, dim=-1) == 21, True, False)] = 0
-        # pX0 last step
         out = f"{out_prefix}.pdb"
 
-        # Now don't output sidechains
         writepdb(
             out,
             denoised_xyz_stack[0, :, :4],
@@ -144,7 +120,6 @@ def main(conf: HydraConfig) -> None:
             bfacts=bfacts,
         )
 
-        # run metadata
         trb = dict(
             config=OmegaConf.to_container(sampler._conf, resolve=True),
             plddt=plddt_stack.cpu().numpy(),
@@ -160,7 +135,6 @@ def main(conf: HydraConfig) -> None:
             pickle.dump(trb, f_out)
 
         if sampler.inf_conf.write_trajectory:
-            # trajectory pdbs
             traj_prefix = (
                 os.path.dirname(out_prefix) + "/traj/" + os.path.basename(out_prefix)
             )
@@ -190,14 +164,17 @@ def main(conf: HydraConfig) -> None:
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
 
-
-def run_inference_with_args(args):
-    # Mock the command-line arguments
-    sys.argv = args
-
-    # Call the main function
-    main()
-
-
 if __name__ == "__main__":
-    main()
+    # Example configuration dictionary
+    config = {
+        'inference': {
+            'deterministic': True,
+            'num_designs': 10,
+            'output_prefix': 'test_outputs/test',
+            'cautious': False,
+            'final_step': 10,
+            'write_trajectory': True
+        },
+        'other_params': '...'
+    }
+    main(config)
