@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 """
-Inference script.
-
-To run with default configuration,
-> python run_inference.py
+Inference script without hydra.
 """
 
 import re
@@ -27,7 +24,6 @@ def main(conf) -> None:
     if conf['inference']['deterministic']:
         make_deterministic()
 
-    # Check for available GPU and print result of check
     if torch.cuda.is_available():
         device_name = torch.cuda.get_device_name(torch.cuda.current_device())
         log.info(f"Found GPU with device_name {device_name}. Will run RFdiffusion on {device_name}")
@@ -36,18 +32,18 @@ def main(conf) -> None:
         log.info("///// NO GPU DETECTED! Falling back to CPU /////")
         log.info("////////////////////////////////////////////////")
 
+    # Convert to DictConfig if needed
+    conf = OmegaConf.create(conf)
+
     # Initialize sampler and target/contig.
     sampler = iu.sampler_selector(conf)
 
-    # Loop over number of designs to sample.
     design_startnum = sampler.inf_conf.design_startnum
     if sampler.inf_conf.design_startnum == -1:
         existing = glob.glob(sampler.inf_conf.output_prefix + "*.pdb")
         indices = [-1]
         for e in existing:
-            print(e)
             m = re.match(".*_(\d+)\.pdb$", e)
-            print(m)
             if not m:
                 continue
             m = m.groups()[0]
@@ -165,8 +161,7 @@ def main(conf) -> None:
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")
 
 if __name__ == "__main__":
-    # Example configuration dictionary
-    config = {
+    config_dict = {
         'inference': {
             'deterministic': True,
             'num_designs': 10,
@@ -175,6 +170,10 @@ if __name__ == "__main__":
             'final_step': 10,
             'write_trajectory': True
         },
+        'scaffoldguided': {
+            'scaffoldguided': False
+        },
         'other_params': '...'
     }
+    config = OmegaConf.create(config_dict)
     main(config)
