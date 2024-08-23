@@ -241,8 +241,8 @@ class Sampler:
 
     def construct_denoiser(self, L, visible):
         """Make length-specific denoiser."""
-        denoise_kwargs = Omegaconf.to_container(self.diffuser_conf)
-        denoise_kwargs.update(Omegaconf.to_container(self.denoiser_conf))
+        denoise_kwargs = OmegaConf.to_container(self.diffuser_conf)
+        denoise_kwargs.update(OmegaConf.to_container(self.denoiser_conf))
         denoise_kwargs.update({
             'L': L,
             'diffuser': self.diffuser,
