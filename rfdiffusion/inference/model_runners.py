@@ -133,7 +133,7 @@ class Sampler:
         ### Initialise Symmetry ###
         ###########################
 
-        if self.inf_conf.rfdiffusion.symmetry is not None:
+        if self.inf_conf.symmetry is not None:
             self.symmetry = symmetry.SymGen(
                 self.inf_conf.rfdiffusion.symmetry,
                 self.inf_conf.rfdiffusion.recenter,
