@@ -92,7 +92,7 @@ class Sampler:
                 self.ckpt_path = f'{model_directory}/Base_ckpt.pt'
         # for saving in trb file:
         assert self._conf.rfdiffusion.inference.trb_save_ckpt_path is None, "trb_save_ckpt_path is not the place to specify an input model. Specify in inference.ckpt_override_path"
-        self._conf['inference']['trb_save_ckpt_path']=self.ckpt_path
+        self._conf['rfdiffusion']['inference']['trb_save_ckpt_path']=self.ckpt_path
 
         #######################
         ### Assemble Config ###
