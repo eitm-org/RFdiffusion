@@ -135,21 +135,21 @@ class Sampler:
 
         if self.inf_conf.symmetry is not None:
             self.symmetry = symmetry.SymGen(
-                self.inf_conf.rfdiffusion.symmetry,
-                self.inf_conf.rfdiffusion.recenter,
-                self.inf_conf.rfdiffusion.radius,
-                self.inf_conf.rfdiffusion.model_only_neighbors,
+                self.inf_conf.symmetry,
+                self.inf_conf.recenter,
+                self.inf_conf.radius,
+                self.inf_conf.model_only_neighbors,
             )
         else:
             self.symmetry = None
 
         self.allatom = ComputeAllAtomCoords().to(self.device)
         
-        if self.inf_conf.rfdiffusion.input_pdb is None:
+        if self.inf_conf.input_pdb is None:
             # set default pdb
             script_dir=os.path.dirname(os.path.realpath(__file__))
-            self.inf_conf.rfdiffusion.input_pdb=os.path.join(script_dir, '../../examples/input_pdbs/1qys.pdb')
-        self.target_feats = iu.process_target(self.inf_conf.rfdiffusion.input_pdb, parse_hetatom=True, center=False)
+            self.inf_conf.input_pdb=os.path.join(script_dir, '../../examples/input_pdbs/1qys.pdb')
+        self.target_feats = iu.process_target(self.inf_conf.input_pdb, parse_hetatom=True, center=False)
         self.chain_idx = None
 
         ##############################
@@ -176,7 +176,7 @@ class Sampler:
     def load_checkpoint(self) -> None:
         """Loads RF checkpoint, from which config can be generated."""
         self._log.info(f'Reading checkpoint from {self.ckpt_path}')
-        print('This is inf_conf.rfdiffusion.ckpt_path')
+        print('This is inf_conf.ckpt_path')
         print(self.ckpt_path)
         self.ckpt  = torch.load(
             self.ckpt_path, map_location=self.device)
@@ -266,7 +266,7 @@ class Sampler:
         ### Parse input pdb ###
         #######################
 
-        self.target_feats = iu.process_target(self.inf_conf.rfdiffusion.input_pdb, parse_hetatom=True, center=False)
+        self.target_feats = iu.process_target(self.inf_conf.input_pdb, parse_hetatom=True, center=False)
 
         ################################
         ### Generate specific contig ###
@@ -315,7 +315,7 @@ class Sampler:
         ### Generate initial coordinates ###
         ####################################
 
-        if self.diffuser_conf.rfdiffusion.partial_T:
+        if self.diffuser_conf.partial_T:
             assert xyz_27.shape[0] == L_mapped, f"there must be a coordinate in the input PDB for \
                     each residue implied by the contig string for partial diffusion.  length of \
                     input PDB != length of contig string: {xyz_27.shape[0]} != {L_mapped}"
@@ -339,11 +339,11 @@ class Sampler:
             atom_mask_mapped[contig_map.hal_idx0] = mask_27[contig_map.ref_idx0]
 
         # Diffuse the contig-mapped coordinates 
-        if self.diffuser_conf.rfdiffusion.partial_T:
-            assert self.diffuser_conf.rfdiffusion.partial_T <= self.diffuser_conf.rfdiffusion.T, "Partial_T must be less than T"
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.partial_T)
+        if self.diffuser_conf.partial_T:
+            assert self.diffuser_conf.partial_T <= self.diffuser_conf.T, "Partial_T must be less than T"
+            self.t_step_input = int(self.diffuser_conf.partial_T)
         else:
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.T)
+            self.t_step_input = int(self.diffuser_conf.T)
         t_list = np.arange(1, self.t_step_input+1)
 
         #################################
@@ -388,8 +388,8 @@ class Sampler:
         ### Parse ligand for ligand potential ###
         #########################################
 
-        if self.potential_conf.rfdiffusion.guiding_potentials is not None:
-            if any(list(filter(lambda x: "substrate_contacts" in x, self.potential_conf.rfdiffusion.guiding_potentials))):
+        if self.potential_conf.guiding_potentials is not None:
+            if any(list(filter(lambda x: "substrate_contacts" in x, self.potential_conf.guiding_potentials))):
                 assert len(self.target_feats['xyz_het']) > 0, "If you're using the Substrate Contact potential, \
                         you need to make sure there's a ligand in the input_pdb file!"
                 het_names = np.array([i['name'].strip() for i in self.target_feats['info_het']])
@@ -435,7 +435,7 @@ class Sampler:
         L = seq.shape[0]
         T = self.T
         binderlen = self.binderlen
-        target_res = self.ppi_conf.rfdiffusion.hotspot_res
+        target_res = self.ppi_conf.hotspot_res
 
         ##################
         ### msa_masked ###
@@ -481,7 +481,7 @@ class Sampler:
         #############
         ### xyz_t ###
         #############
-        if self.preprocess_conf.rfdiffusion.sidechain_input:
+        if self.preprocess_conf.sidechain_input:
             xyz_t[torch.where(seq == 21, True, False),3:,:] = float('nan')
         else:
             xyz_t[~self.mask_str.squeeze(),3:,:] = float('nan')
@@ -523,14 +523,14 @@ class Sampler:
         ######################
         ### added_features ###
         ######################
-        if self.preprocess_conf.rfdiffusion.d_t1d >= 24: # add hotspot residues
+        if self.preprocess_conf.d_t1d >= 24: # add hotspot residues
             hotspot_tens = torch.zeros(L).float()
-            if self.ppi_conf.rfdiffusion.hotspot_res is None:
+            if self.ppi_conf.hotspot_res is None:
                 print("WARNING: you're using a model trained on complexes and hotspot residues, without specifying hotspots.\
                          If you're doing monomer diffusion this is fine")
                 hotspot_idx=[]
             else:
-                hotspots = [(i[0],int(i[1:])) for i in self.ppi_conf.rfdiffusion.hotspot_res]
+                hotspots = [(i[0],int(i[1:])) for i in self.ppi_conf.hotspot_res]
                 hotspot_idx=[]
                 for i,res in enumerate(self.contig_map.con_ref_pdb_idx):
                     if res in hotspots:
@@ -602,7 +602,7 @@ class Sampler:
                 px0=px0,
                 t=t,
                 diffusion_mask=self.mask_str.squeeze(),
-                align_motif=self.inf_conf.rfdiffusion.align_motif
+                align_motif=self.inf_conf.align_motif
             )
         else:
             x_t_1 = torch.clone(px0).to(x_t.device)
@@ -643,7 +643,7 @@ class SelfConditioning(Sampler):
         ##################################
         ######## Str Self Cond ###########
         ##################################
-        if (t < self.diffuser.T) and (t != self.diffuser_conf.rfdiffusion.partial_T):   
+        if (t < self.diffuser.T) and (t != self.diffuser_conf.partial_T):   
             zeros = torch.zeros(B,1,L,24,3).float().to(xyz_t.device)
             xyz_t = torch.cat((self.prev_pred.unsqueeze(1),zeros), dim=-2) # [B,T,L,27,3]
             t2d_44   = xyz_to_t2d(xyz_t) # [B,T,L,L,44]
@@ -677,7 +677,7 @@ class SelfConditioning(Sampler):
                                 return_infer=True,
                                 motif_mask=self.diffusion_mask.squeeze().to(self.device))   
 
-            if self.symmetry is not None and self.inf_conf.rfdiffusion.symmetric_self_cond:
+            if self.symmetry is not None and self.inf_conf.symmetric_self_cond:
                 px0 = self.symmetrise_prev_pred(px0=px0,seq_in=seq_in, alpha=alpha)[:,:,:3]
 
         self.prev_pred = torch.clone(px0)
@@ -697,8 +697,8 @@ class SelfConditioning(Sampler):
                 px0=px0,
                 t=t,
                 diffusion_mask=self.mask_str.squeeze(),
-                align_motif=self.inf_conf.rfdiffusion.align_motif,
-                include_motif_sidechains=self.preprocess_conf.rfdiffusion.motif_sidechain_input
+                align_motif=self.inf_conf.align_motif,
+                include_motif_sidechains=self.preprocess_conf.motif_sidechain_input
             )
             self._log.info(
                     f'Timestep {t}, input to next step: { seq2chars(torch.argmax(seq_t_1, dim=-1).tolist())}')
@@ -780,7 +780,7 @@ class ScaffoldedSampler(SelfConditioning):
         ### Auto-contig generation ###
         ##############################    
 
-        if self.contig_conf.rfdiffusion.contigs is None: 
+        if self.contig_conf.contigs is None: 
             # process target
             xT = torch.full((self.L, 27,3), np.nan)
             xT = get_init_xyz(xT[None,None]).squeeze()
@@ -832,7 +832,7 @@ class ScaffoldedSampler(SelfConditioning):
             assert self.target is None, "Giving a target is the wrong way of handling this is you're doing contigs and secondary structure"
 
             # process target and reinitialise potential_manager. This is here because the 'target' is always set up to be the second chain in out inputs.
-            self.target_feats = iu.process_target(self.inf_conf.rfdiffusion.input_pdb)
+            self.target_feats = iu.process_target(self.inf_conf.input_pdb)
             self.contig_map = self.construct_contig(self.target_feats)
             self.mappings = self.contig_map.get_mappings()
             self.mask_seq = torch.from_numpy(self.contig_map.inpaint_seq)[None,:]
@@ -880,11 +880,11 @@ class ScaffoldedSampler(SelfConditioning):
         ### Handle Partial T ###
         ########################
 
-        if self.diffuser_conf.rfdiffusion.partial_T:
-            assert self.diffuser_conf.rfdiffusion.partial_T <= self.diffuser_conf.rfdiffusion.T
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.partial_T)
+        if self.diffuser_conf.partial_T:
+            assert self.diffuser_conf.partial_T <= self.diffuser_conf.T
+            self.t_step_input = int(self.diffuser_conf.partial_T)
         else:
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.T)
+            self.t_step_input = int(self.diffuser_conf.T)
         t_list = np.arange(1, self.t_step_input+1)
         seq_T=torch.nn.functional.one_hot(seq_T, num_classes=22).float()
 
@@ -894,7 +894,7 @@ class ScaffoldedSampler(SelfConditioning):
             atom_mask.squeeze(),
             diffusion_mask=self.diffusion_mask.squeeze(),
             t_list=t_list,
-            include_motif_sidechains=self.preprocess_conf.rfdiffusion.motif_sidechain_input)
+            include_motif_sidechains=self.preprocess_conf.motif_sidechain_input)
 
         #######################
         ### Set up Denoiser ###
@@ -913,8 +913,8 @@ class ScaffoldedSampler(SelfConditioning):
         ### Add Adj/Secondary Structure ###
         ###################################
 
-        assert self.preprocess_conf.rfdiffusion.d_t1d == 28, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
-        assert self.preprocess_conf.rfdiffusion.d_t2d == 47, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
+        assert self.preprocess_conf.d_t1d == 28, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
+        assert self.preprocess_conf.d_t2d == 47, "The checkpoint you're using hasn't been trained with sec-struc/block adjacency features"
        
         #####################
         ### Handle Target ###
