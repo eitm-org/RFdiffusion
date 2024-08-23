@@ -648,11 +648,11 @@ def get_idx0_hotspots(mappings, ppi_conf, binderlen):
 
     hotspot_idx = None
     if binderlen > 0:
-        if ppi_conf.rfdiffusion.hotspot_res is not None:
+        if ppi_conf.hotspot_res is not None:
             assert all(
-                [i[0].isalpha() for i in ppi_conf.rfdiffusion.hotspot_res]
+                [i[0].isalpha() for i in ppi_conf.hotspot_res]
             ), "Hotspot residues need to be provided in pdb-indexed form. E.g. A100,A103"
-            hotspots = [(i[0], int(i[1:])) for i in ppi_conf.rfdiffusion.hotspot_res]
+            hotspots = [(i[0], int(i[1:])) for i in ppi_conf.hotspot_res]
             hotspot_idx = []
             for i, res in enumerate(mappings["receptor_con_ref_pdb_idx"]):
                 if res in hotspots:
