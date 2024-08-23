@@ -156,11 +156,11 @@ class Sampler:
         ### Handle Partial Noising ###
         ##############################
 
-        if self.diffuser_conf.rfdiffusion.partial_T:
-            assert self.diffuser_conf.rfdiffusion.partial_T <= self.diffuser_conf.rfdiffusion.T
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.partial_T)
+        if self.diffuser_conf.partial_T:
+            assert self.diffuser_conf.partial_T <= self.diffuser_conf.T
+            self.t_step_input = int(self.diffuser_conf.partial_T)
         else:
-            self.t_step_input = int(self.diffuser_conf.rfdiffusion.T)
+            self.t_step_input = int(self.diffuser_conf.T)
         
     @property
     def T(self):
@@ -171,7 +171,7 @@ class Sampler:
             Output:
                 T (int): The maximum number of timesteps to perform
         '''
-        return self.diffuser_conf.rfdiffusion.T
+        return self.diffuser_conf.T
 
     def load_checkpoint(self) -> None:
         """Loads RF checkpoint, from which config can be generated."""
@@ -236,7 +236,7 @@ class Sampler:
         """
         Construct contig class describing the protein to be generated
         """
-        self._log.info(f'Using contig: {self.contig_conf.rfdiffusion.contigs}')
+        self._log.info(f'Using contig: {self.contig_conf.contigs}')
         return ContigMap(target_feats, **self.contig_conf)
 
     def construct_denoiser(self, L, visible):
