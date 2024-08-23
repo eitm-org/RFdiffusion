@@ -203,10 +203,10 @@ class Sampler:
         print("Assembling -model, -diffuser and -preprocess configs from checkpoint")
 
         for cat in ['model','diffuser','preprocess']:
-            for key in self._conf[cat]:
+            for key in self._conf['rfdiffusion'][cat]:
                 try:
-                    print(f"USING MODEL CONFIG: self._conf[{cat}][{key}] = {self.ckpt['config_dict'][cat][key]}")
-                    self._conf[cat][key] = self.ckpt['config_dict'][cat][key]
+                    print(f"USING MODEL CONFIG: self._conf['rfdiffusion'][{cat}][{key}] = {self.ckpt['config_dict'][cat][key]}")
+                    self._conf['rfdiffusion'][cat][key] = self.ckpt['config_dict'][cat][key]
                 except:
                     pass
         
@@ -214,8 +214,8 @@ class Sampler:
         for override in overrides:
             if override.split(".")[0] in ['model','diffuser','preprocess']:
                 print(f'WARNING: You are changing {override.split("=")[0]} from the value this model was trained with. Are you sure you know what you are doing?') 
-                mytype = type(self._conf[override.split(".")[0]][override.split(".")[1].split("=")[0]])
-                self._conf[override.split(".")[0]][override.split(".")[1].split("=")[0]] = mytype(override.split("=")[1])
+                mytype = type(self._conf['rfdiffusion'][override.split(".")[0]][override.split(".")[1].split("=")[0]])
+                self._conf['rfdiffusion'][override.split(".")[0]][override.split(".")[1].split("=")[0]] = mytype(override.split("=")[1])
 
     def load_model(self):
         """Create RosettaFold model from preloaded checkpoint."""
