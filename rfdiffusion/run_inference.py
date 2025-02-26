@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 """
-Inference script callable as a function.
-
-To call as a function, provide a configuration file.
+Inference script with data saving for consistency model training.
 """
 
 import re
@@ -17,7 +15,6 @@ from rfdiffusion.inference import utils as iu
 import numpy as np
 import random
 import glob
-import importlib.resources as pkg_resources
 
 def make_deterministic(seed=0):
     torch.manual_seed(seed)
@@ -25,7 +22,9 @@ def make_deterministic(seed=0):
     random.seed(seed)
 
 def run_inference(
-    config_file=None  # Path to the YAML configuration file
+    config_file="../config.yml",  # Path to the YAML configuration file
+    save_data=True,   # Option to save intermediate states
+    save_dir='diffusion_data'  # Directory to save data if enabled
 ):
     log = logging.getLogger(__name__)
     
@@ -67,6 +66,10 @@ def run_inference(
             indices.append(int(m))
         design_startnum = max(indices) + 1
 
+    # Create directory to save data
+    if save_data:
+        os.makedirs(save_dir, exist_ok=True)
+
     for i_des in range(design_startnum, design_startnum + num_designs):
         if deterministic:
             make_deterministic(i_des)
@@ -75,9 +78,7 @@ def run_inference(
         out_prefix = f"{sampler.inf_conf.output_prefix}_{i_des}"
         log.info(f"Making design {out_prefix}")
         if cautious and os.path.exists(out_prefix + ".pdb"):
-            log.info(
-                f"(cautious mode) Skipping this design because {out_prefix}.pdb already exists."
-            )
+            log.info(f"(cautious mode) Skipping this design because {out_prefix}.pdb already exists.")
             continue
 
         x_init, seq_init = sampler.sample_init()
@@ -88,6 +89,7 @@ def run_inference(
 
         x_t = torch.clone(x_init)
         seq_t = torch.clone(seq_init)
+        
         # Loop over number of reverse diffusion time steps.
         for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step - 1, -1):
             px0, x_t, seq_t, plddt = sampler.sample_step(
@@ -98,26 +100,18 @@ def run_inference(
             seq_stack.append(seq_t)
             plddt_stack.append(plddt[0])  # remove singleton leading dimension
 
+            # Save intermediate noisy (x_t) and denoised (px0) states
+            if save_data:
+                torch.save(x_t, f"{save_dir}/intermediate_state_design_{i_des}_t_{t}.pt")
+                torch.save(px0, f"{save_dir}/denoised_state_design_{i_des}_t_{t}.pt")
+
         # Flip order for better visualization in pymol
         denoised_xyz_stack = torch.stack(denoised_xyz_stack)
-        denoised_xyz_stack = torch.flip(
-            denoised_xyz_stack,
-            [
-                0,
-            ],
-        )
+        denoised_xyz_stack = torch.flip(denoised_xyz_stack, [0])
         px0_xyz_stack = torch.stack(px0_xyz_stack)
-        px0_xyz_stack = torch.flip(
-            px0_xyz_stack,
-            [
-                0,
-            ],
-        )
+        px0_xyz_stack = torch.flip(px0_xyz_stack, [0])
 
-        # For logging -- don't flip
-        plddt_stack = torch.stack(plddt_stack)
-
-        # Save outputs
+        # Save final outputs (optional)
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
         final_seq = seq_stack[-1]
 
@@ -129,6 +123,7 @@ def run_inference(
         bfacts = torch.ones_like(final_seq.squeeze())
         # make bfact=0 for diffused coordinates
         bfacts[torch.where(torch.argmax(seq_init, dim=-1) == 21, True, False)] = 0
+
         # pX0 last step
         out = f"{out_prefix}.pdb"
 
@@ -145,10 +140,8 @@ def run_inference(
         # run metadata
         trb = dict(
             config=OmegaConf.to_container(sampler._conf, resolve=True),
-            plddt=plddt_stack.cpu().numpy(),
-            device=torch.cuda.get_device_name(torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else "CPU",
+            plddt=torch.stack(plddt_stack).cpu().numpy(),
+            device=torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else "CPU",
             time=time.time() - start_time,
         )
         if hasattr(sampler, "contig_map"):
@@ -156,34 +149,5 @@ def run_inference(
                 trb[key] = value
         with open(f"{out_prefix}.trb", "wb") as f_out:
             pickle.dump(trb, f_out)
-
-        if write_trajectory:
-            # trajectory pdbs
-            traj_prefix = (
-                os.path.dirname(out_prefix) + "/traj/" + os.path.basename(out_prefix)
-            )
-            os.makedirs(os.path.dirname(traj_prefix), exist_ok=True)
-
-            out = f"{traj_prefix}_Xt-1_traj.pdb"
-            writepdb_multi(
-                out,
-                denoised_xyz_stack,
-                bfacts,
-                final_seq.squeeze(),
-                use_hydrogens=False,
-                backbone_only=False,
-                chain_ids=sampler.chain_idx,
-            )
-
-            out = f"{traj_prefix}_pX0_traj.pdb"
-            writepdb_multi(
-                out,
-                px0_xyz_stack,
-                bfacts,
-                final_seq.squeeze(),
-                use_hydrogens=False,
-                backbone_only=False,
-                chain_ids=sampler.chain_idx,
-            )
 
         log.info(f"Finished design in {(time.time()-start_time)/60:.2f} minutes")

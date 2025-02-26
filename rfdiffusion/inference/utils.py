@@ -16,8 +16,14 @@ import glob
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
 ###########################################################
+import logging
 
+logging.basicConfig(level=logging.INFO)  # or DEBUG for more verbosity
+log = logging.getLogger(__name__)
 
+def check_for_nans(tensor, name):
+    if torch.isnan(tensor).any():
+        log.error(f"NaN detected in {name}: {tensor}")
 def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=1.0):
     """
     get_next_frames gets updated frames using IGSO(3) + score_based reverse diffusion.
@@ -434,7 +440,6 @@ class Denoise:
 
             include_motif_sidechains (bool): Provide sidechains of the fixed motif to the model
         """
-
         get_allatom = ComputeAllAtomCoords().to(device=xt.device)
         L, n_atom = xt.shape[:2]
         assert (xt.shape[1] == 14) or (xt.shape[1] == 27)
@@ -447,7 +452,6 @@ class Denoise:
         if align_motif and diffusion_mask.any():
             px0 = self.align_to_xt_motif(px0, xt, diffusion_mask)
         # xT_motif_aligned = self.align_to_xt_motif(px0, xt, diffusion_mask)
-
         px0 = px0.to(xt.device)
         # Now done with diffusion mask. if fix motif is False, just set diffusion mask to be all True, and all coordinates can diffuse
         if not fix_motif:
@@ -477,7 +481,6 @@ class Denoise:
             diffusion_mask=diffusion_mask,
             noise_scale=noise_scale_frame,
         )
-
         # Apply gradient step from guiding potentials
         # This can be moved to below where the full atom representation is calculated to allow for potentials involving sidechains
 
@@ -489,7 +492,6 @@ class Denoise:
 
         # add the delta to the new frames
         frames_next = torch.from_numpy(frames_next) + ca_deltas[:, None, :]  # translate
-
         fullatom_next = torch.full_like(xt, float("nan")).unsqueeze(0)
         fullatom_next[:, :, :3] = frames_next[None]
         # This is never used so just make it a fudged tensor - NRB
