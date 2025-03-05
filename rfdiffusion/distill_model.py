@@ -13,6 +13,8 @@ from rfdiffusion.inference import utils as iu
 from rfdiffusion.diffusion import Diffuser
 from rfdiffusion.RoseTTAFoldModel import RoseTTAFoldModule
 from rfdiffusion.util_module import ComputeAllAtomCoords
+from rfdiffusion.util import calc_rmsd
+import numpy as np
 
 class RFDiffusionDistiller:
     """
@@ -509,12 +511,343 @@ class RFDiffusionDistiller:
         Returns:
             2D features
         """
-            
         # This is a simplified placeholder
         # In practice, use the actual implementation from RFdiffusion
         B, T, L = xyz.shape[:3]
         t2d = torch.zeros((B, T, L, L, 44), device=self.device)
         return t2d
+        
+    def compute_rfdiffusion_loss(self, pred, target, seq=None, w2D=0.5):
+        """
+        Compute loss the same way RFdiffusion does during training.
+        This function is provided for external use in training pipelines.
+        
+        Args:
+            pred: Predicted coordinates [B, L, 14, 3] or [L, 14, 3]
+            target: Target coordinates [B, L, 14, 3] or [L, 14, 3]
+            seq: Sequence information [B, L] or [L] (optional)
+            w2D: Weight for the L2D term (default: 0.5)
+            
+        Returns:
+            Combined loss value (LFrame + w2D * L2D)
+        """
+        if len(pred.shape) == 3:
+            # Add batch dimension if not present
+            pred = pred.unsqueeze(0)
+            target = target.unsqueeze(0)
+        
+        # Compute frame loss (coordinate-based MSE loss)
+        frame_loss = self.compute_frame_loss(pred, target)
+        
+        # Compute 2D loss (inter-residue geometry loss)
+        # This includes distances and orientations between residues
+        l2d_loss = self.compute_2d_loss(pred, target, seq)
+        
+        # Combine losses as in RFdiffusion
+        total_loss = frame_loss + w2D * l2d_loss
+        
+        return total_loss
+        
+    def compute_frame_loss(self, pred, target):
+        """
+        Compute coordinate-based frame loss as used in RFdiffusion
+        
+        Args:
+            pred: Predicted coordinates [B, L, 14, 3]
+            target: Target coordinates [B, L, 14, 3]
+            
+        Returns:
+            Frame loss value
+        """
+        # Get backbone atoms (N, CA, C)
+        pred_bb = pred[:, :, :3]
+        target_bb = target[:, :, :3]
+        
+        # MSE loss on backbone atoms coordinates
+        bb_loss = F.mse_loss(pred_bb, target_bb)
+        
+        # Get CB atoms (index 4)
+        # If no CB (e.g., for GLY), this will be a virtual CB
+        pred_cb = pred[:, :, 4]
+        target_cb = target[:, :, 4]
+        
+        # MSE loss on CB atoms
+        cb_loss = F.mse_loss(pred_cb, target_cb)
+        
+        # Final frame loss is weighted sum
+        frame_loss = bb_loss + cb_loss
+        
+        return frame_loss
+    
+    def compute_2d_loss(self, pred, target, seq=None):
+        """
+        Compute inter-residue geometry loss (L2D) as used in RFdiffusion
+        
+        Args:
+            pred: Predicted coordinates [B, L, 14, 3]
+            target: Target coordinates [B, L, 14, 3]
+            seq: Sequence information [B, L] (optional)
+            
+        Returns:
+            2D loss value
+        """
+        B, L = pred.shape[:2]
+        
+        # Extract relevant atoms for geometry calculations
+        pred_ca = pred[:, :, 1]  # CA atoms
+        pred_cb = pred[:, :, 4]  # CB atoms (or virtual CB)
+        pred_n = pred[:, :, 0]   # N atoms
+        
+        target_ca = target[:, :, 1]
+        target_cb = target[:, :, 4]
+        target_n = target[:, :, 0]
+        
+        # Initialize loss components
+        dist_loss = 0.0
+        omega_loss = 0.0
+        theta_loss = 0.0
+        phi_loss = 0.0
+        
+        # For each batch
+        for b in range(B):
+            # 1. Compute CB-CB distances
+            pred_cb_dists = torch.cdist(pred_cb[b], pred_cb[b])
+            target_cb_dists = torch.cdist(target_cb[b], target_cb[b])
+            
+            # Convert to binned distributions with 37 bins (0-18.5Å in 0.5Å steps)
+            # RFdiffusion uses a one-hot encoding, but we'll use KL divergence between distributions
+            pred_cb_dist_bins = self._bin_distances(pred_cb_dists)
+            target_cb_dist_bins = self._bin_distances(target_cb_dists)
+            
+            # 2. Compute dihedral angles: Dihedral(Cα,l, Cβ,l, Cα,l′, Cβ,l′)
+            pred_omega = self._compute_dihedral_matrix(
+                pred_ca[b], pred_cb[b], pred_ca[b].unsqueeze(0), pred_cb[b].unsqueeze(0)
+            )
+            target_omega = self._compute_dihedral_matrix(
+                target_ca[b], target_cb[b], target_ca[b].unsqueeze(0), target_cb[b].unsqueeze(0)
+            )
+            
+            # 3. Compute dihedral angles: Dihedral(N,l, Cα,l, Cβ,l, Cβ,l′)
+            pred_theta = self._compute_dihedral_matrix(
+                pred_n[b], pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0)
+            )
+            target_theta = self._compute_dihedral_matrix(
+                target_n[b], target_ca[b], target_cb[b], target_cb[b].unsqueeze(0)
+            )
+            
+            # 4. Compute planar angles: Planar(Cα,l, Cβ,l, Cβ,l′)
+            pred_phi = self._compute_planar_matrix(
+                pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0)
+            )
+            target_phi = self._compute_planar_matrix(
+                target_ca[b], target_cb[b], target_cb[b].unsqueeze(0)
+            )
+            
+            # Convert angles to binned distributions
+            pred_omega_bins = self._bin_angles(pred_omega, angle_type="dihedral")
+            target_omega_bins = self._bin_angles(target_omega, angle_type="dihedral")
+            
+            pred_theta_bins = self._bin_angles(pred_theta, angle_type="dihedral")
+            target_theta_bins = self._bin_angles(target_theta, angle_type="dihedral")
+            
+            pred_phi_bins = self._bin_angles(pred_phi, angle_type="planar")
+            target_phi_bins = self._bin_angles(target_phi, angle_type="planar")
+            
+            # Compute KL divergence between predicted and target distributions
+            dist_loss += F.kl_div(
+                F.log_softmax(pred_cb_dist_bins, dim=-1),
+                F.softmax(target_cb_dist_bins, dim=-1),
+                reduction='none'
+            ).mean()
+            
+            omega_loss += F.kl_div(
+                F.log_softmax(pred_omega_bins, dim=-1),
+                F.softmax(target_omega_bins, dim=-1),
+                reduction='none'
+            ).mean()
+            
+            theta_loss += F.kl_div(
+                F.log_softmax(pred_theta_bins, dim=-1),
+                F.softmax(target_theta_bins, dim=-1),
+                reduction='none'
+            ).mean()
+            
+            phi_loss += F.kl_div(
+                F.log_softmax(pred_phi_bins, dim=-1),
+                F.softmax(target_phi_bins, dim=-1),
+                reduction='none'
+            ).mean()
+        
+        # Combine all geometry losses
+        l2d_loss = (dist_loss + omega_loss + theta_loss + phi_loss) / B
+        
+        return l2d_loss
+    
+    def _bin_distances(self, distances, num_bins=37, max_dist=18.5):
+        """
+        Convert distances to binned distributions
+        
+        Args:
+            distances: Pairwise distance matrix [L, L]
+            num_bins: Number of bins (default: 37 for 0-18.5Å in 0.5Å steps)
+            max_dist: Maximum distance to consider
+            
+        Returns:
+            Binned distance distributions [L, L, num_bins]
+        """
+        bin_size = max_dist / num_bins
+        bins = torch.arange(0, max_dist + bin_size, bin_size, device=self.device)
+        
+        # Clamp distances to max_dist
+        distances = torch.clamp(distances, 0, max_dist)
+        
+        # Convert to bin indices
+        bin_indices = torch.floor(distances / bin_size).long()
+        
+        # Create one-hot encoding
+        binned_dists = torch.zeros(*distances.shape, num_bins, device=self.device)
+        
+        # For each position, set the corresponding bin to 1
+        for i in range(distances.shape[0]):
+            for j in range(distances.shape[1]):
+                binned_dists[i, j, bin_indices[i, j]] = 1.0
+                
+        return binned_dists
+    
+    def _bin_angles(self, angles, angle_type="dihedral", eps=1e-8):
+        """
+        Convert angles to binned distributions
+        
+        Args:
+            angles: Angle matrix [L, L]
+            angle_type: Type of angle ("dihedral" or "planar")
+            eps: Small epsilon for numerical stability
+            
+        Returns:
+            Binned angle distributions
+        """
+        if angle_type == "dihedral":
+            # For dihedral angles: 37 bins from -π to π
+            num_bins = 37
+            min_val = -torch.pi
+            max_val = torch.pi
+        else:  # planar
+            # For planar angles: 19 bins from 0 to π
+            num_bins = 19
+            min_val = 0
+            max_val = torch.pi
+            
+        bin_size = (max_val - min_val) / num_bins
+        
+        # Clamp angles to valid range
+        angles = torch.clamp(angles, min_val + eps, max_val - eps)
+        
+        # Convert to bin indices
+        bin_indices = torch.floor((angles - min_val) / bin_size).long()
+        
+        # Create one-hot encoding
+        binned_angles = torch.zeros(*angles.shape, num_bins, device=self.device)
+        
+        # For each position, set the corresponding bin to 1
+        for i in range(angles.shape[0]):
+            for j in range(angles.shape[1]):
+                binned_angles[i, j, bin_indices[i, j]] = 1.0
+                
+        return binned_angles
+    
+    def _compute_dihedral_matrix(self, a, b, c, d):
+        """
+        Compute dihedral angles between residues
+        
+        Args:
+            a, b, c, d: Atom coordinates [L, 3]
+            
+        Returns:
+            Dihedral angle matrix [L, L]
+        """
+        L = a.shape[0]
+        dihedrals = torch.zeros((L, L), device=self.device)
+        
+        # Compute dihedral angles for each pair of residues
+        for i in range(L):
+            for j in range(L):
+                if i != j:
+                    # Calculate vectors
+                    v1 = b[i] - a[i]  # a->b
+                    v2 = c[j] - b[i]  # b->c
+                    v3 = d[j] - c[j]  # c->d
+                    
+                    # Normalize vectors
+                    v1 = v1 / (torch.norm(v1) + 1e-8)
+                    v2 = v2 / (torch.norm(v2) + 1e-8)
+                    v3 = v3 / (torch.norm(v3) + 1e-8)
+                    
+                    # Compute cross products
+                    n1 = torch.cross(v1, v2)
+                    n2 = torch.cross(v2, v3)
+                    
+                    # Normalize normal vectors
+                    n1 = n1 / (torch.norm(n1) + 1e-8)
+                    n2 = n2 / (torch.norm(n2) + 1e-8)
+                    
+                    # Compute dihedral angle
+                    x = torch.dot(n1, n2)
+                    y = torch.dot(torch.cross(n1, v2/torch.norm(v2)), n2)
+                    
+                    # Calculate dihedral using atan2
+                    dihedral = torch.atan2(y, x)
+                    dihedrals[i, j] = dihedral
+        
+        return dihedrals
+    
+    def _compute_planar_matrix(self, a, b, c):
+        """
+        Compute planar angles between residues
+        
+        Args:
+            a, b, c: Atom coordinates [L, 3]
+            
+        Returns:
+            Planar angle matrix [L, L]
+        """
+        L = a.shape[0]
+        angles = torch.zeros((L, L), device=self.device)
+        
+        # Compute planar angles for each pair of residues
+        for i in range(L):
+            for j in range(L):
+                if i != j:
+                    # Calculate vectors
+                    v1 = a[i] - b[i]  # a->b
+                    v2 = c[j] - b[i]  # b->c
+                    
+                    # Normalize vectors
+                    v1_norm = torch.norm(v1) + 1e-8
+                    v2_norm = torch.norm(v2) + 1e-8
+                    
+                    # Compute cosine of angle
+                    cos_angle = torch.dot(v1, v2) / (v1_norm * v2_norm)
+                    cos_angle = torch.clamp(cos_angle, -1.0 + 1e-8, 1.0 - 1e-8)
+                    
+                    # Compute angle
+                    angle = torch.acos(cos_angle)
+                    angles[i, j] = angle
+        
+        return angles
+        
+    def compute_score_loss(self, pred_score, target_score):
+        """
+        Compute loss between predicted and target score functions
+        
+        Args:
+            pred_score: Predicted score
+            target_score: Target score
+            
+        Returns:
+            Loss value
+        """
+        # Use MSE loss for score matching
+        return F.mse_loss(pred_score, target_score)
     
     def compute_teacher_prediction(self, batch):
         """
@@ -643,7 +976,7 @@ class RFDiffusionDistiller:
             
             # Compute loss - score matching loss
             # This directly trains the student to match the teacher's score function
-            loss = F.mse_loss(student_score, teacher_score)
+            loss = self.compute_score_loss(student_score, teacher_score)
         else:
             # Standard x0 prediction matching
             # Get teacher prediction of clean x0
