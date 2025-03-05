@@ -27,42 +27,73 @@ def main():
         batch = distiller.get_single_diffusion_step(protein_length=protein_length, timestep=10)
         print(f"Generated step data with shape: {batch['x_t'].shape}")
         
-        # Example 2: Directly calculate the score function
-        print("\nCalculating score function...")
+        # Example 2: Calculate teacher and student score functions
+        print("\nCalculating teacher score function...")
         seq = batch['seq'][0]  # Get the sequence from the batch
-        score = distiller.compute_score(seq, batch['x_t'], batch['timestep'])
-        print(f"Score function shape: {score.shape}")
+        teacher_score = distiller.compute_teacher_score(seq, batch['x_t'], batch['timestep'])
+        print(f"Teacher score function shape: {teacher_score.shape}")
         
-        # Example 3: Apply the score update
-        print("\nApplying score update...")
-        x_prev_from_score = distiller.apply_score_update(batch['x_t'], score, batch['timestep'])
-        print(f"Updated coordinates shape: {x_prev_from_score.shape}")
+        print("\nCalculating student score function...")
+        student_score = distiller.compute_student_score(seq, batch['x_t'], batch['timestep'])
+        print(f"Student score function shape: {student_score.shape}")
         
-        # Example 4: Get teacher model prediction
-        print("\nGetting teacher model prediction...")
+        # Example 3: Calculate score difference between teacher and student
+        print("\nCalculating score difference...")
+        score_diff = torch.norm(teacher_score - student_score, dim=-1).mean()
+        print(f"Average score difference: {score_diff:.6f}")
+        
+        # Example 4: Apply the score update using teacher score
+        print("\nApplying score update using teacher score...")
+        x_prev_from_teacher = distiller.apply_score_update(batch['x_t'], teacher_score, batch['timestep'])
+        print(f"Updated coordinates shape: {x_prev_from_teacher.shape}")
+        
+        # Example 5: Apply the score update using student score
+        print("\nApplying score update using student score...")
+        x_prev_from_student = distiller.apply_score_update(batch['x_t'], student_score, batch['timestep'])
+        print(f"Updated coordinates shape: {x_prev_from_student.shape}")
+        
+        # Example 6: Get teacher model prediction of x0
+        print("\nGetting teacher model prediction of x0...")
         teacher_pred = distiller.compute_teacher_prediction(batch)
-        print(f"Teacher prediction shape: {teacher_pred.shape}")
+        print(f"Teacher x0 prediction shape: {teacher_pred.shape}")
         
-        # Example 5: Get student model prediction
-        print("\nGetting student model prediction...")
+        # Example 7: Get student model prediction of x0
+        print("\nGetting student model prediction of x0...")
         student_pred = distiller.compute_student_prediction(batch)
-        print(f"Student prediction shape: {student_pred.shape}")
+        print(f"Student x0 prediction shape: {student_pred.shape}")
         
-        # Example 6: Train for a few steps
-        print("\nTraining the student model for a few steps...")
+        # Example 8: Calculate prediction difference between teacher and student
+        print("\nCalculating x0 prediction difference...")
+        pred_diff = torch.norm(teacher_pred - student_pred, dim=-1).mean()
+        print(f"Average x0 prediction difference: {pred_diff:.6f}")
+        
+        # Example 9: Train for a few steps using x0 prediction matching
+        print("\nTraining the student model on x0 prediction for a few steps...")
         optimizer = torch.optim.Adam(distiller.student_model.parameters(), lr=1e-4)
-        losses = []
-        for i in range(3):  # Just a few steps for demonstration
-            loss = distiller.train_step(optimizer, protein_length=protein_length)
-            losses.append(loss)
-            print(f"Step {i}, Loss: {loss:.6f}")
+        x0_losses = []
+        for i in range(2):  # Just a few steps for demonstration
+            loss = distiller.train_step(optimizer, protein_length=protein_length, train_on_score=False)
+            x0_losses.append(loss)
+            print(f"Step {i}, X0 Prediction Loss: {loss:.6f}")
         
-        # Example 7: Generate full trajectory for encoding
+        # Example 10: Train for a few steps using score matching
+        print("\nTraining the student model on score matching for a few steps...")
+        optimizer = torch.optim.Adam(distiller.student_model.parameters(), lr=1e-4)
+        score_losses = []
+        for i in range(2):  # Just a few steps for demonstration
+            loss = distiller.train_step(optimizer, protein_length=protein_length, train_on_score=True)
+            score_losses.append(loss)
+            print(f"Step {i}, Score Matching Loss: {loss:.6f}")
+            
+        # Combine losses for plotting
+        losses = x0_losses + score_losses
+        
+        # Example 11: Generate full trajectory for encoding
         print("\nGenerating short trajectory for encoding...")
         trajectory = distiller.encode_trajectory(protein_length=protein_length, num_steps=5)
         print(f"Trajectory contains {len(trajectory['x_t'])} timesteps")
         
-        # Example 8: Save student model
+        # Example 12: Save student model
         print("\nSaving student model checkpoint...")
         os.makedirs("checkpoints", exist_ok=True)
         distiller.save_student_model("checkpoints/student_model.pt")
