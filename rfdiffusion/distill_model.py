@@ -175,6 +175,45 @@ class RFDiffusionDistiller:
         t_idx = timestep - 1
         return torch.sqrt(self.diffuser.eucl_diffuser.beta_schedule[t_idx])
         
+    def add_noise(self, x_0, timestep, noise=None):
+        """
+        Add noise to protein coordinates for a specific timestep.
+        This function is provided for external use in training pipelines.
+        
+        Args:
+            x_0: Clean protein coordinates [B, L, 14, 3] or [L, 14, 3]
+            timestep: Timestep (1-indexed) to noise to 
+            noise: Optional pre-generated noise; if None, random noise will be generated
+            
+        Returns:
+            x_t: Noised coordinates at timestep t
+            noise: The noise that was added (for calculating targets in training)
+        """
+        # Add batch dimension if not present
+        if len(x_0.shape) == 3:
+            x_0 = x_0.unsqueeze(0)
+            
+        B, L = x_0.shape[:2]
+        
+        # Convert to 0-indexed for scheduler
+        t_idx = timestep - 1
+        
+        # Get noise parameters for this timestep
+        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+        alpha_t = self.diffuser.eucl_diffuser.alpha_schedule[t_idx]
+        alpha_bar_t = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx]
+        
+        # Generate noise if not provided
+        if noise is None:
+            noise = torch.randn_like(x_0, device=self.device)
+            
+        # Apply noise schedule following the forward diffusion process
+        # For variance preserving (VP) SDE:
+        # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+        x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
+        
+        return x_t, noise
+        
     def _get_diffusion_step(self, protein_length=150, timestep=10):
         """
         Get a proper diffusion step using the diffuser and score function
@@ -837,7 +876,8 @@ class RFDiffusionDistiller:
         
     def compute_score_loss(self, pred_score, target_score):
         """
-        Compute loss between predicted and target score functions
+        Compute loss between predicted and target score functions.
+        This function is provided for external use in training pipelines.
         
         Args:
             pred_score: Predicted score
@@ -848,6 +888,38 @@ class RFDiffusionDistiller:
         """
         # Use MSE loss for score matching
         return F.mse_loss(pred_score, target_score)
+    
+    def calculate_kl_divergence_loss(self, student_score, teacher_score, x_t, timestep):
+        """
+        Calculate the KL divergence loss between student and teacher score functions.
+        This implements the training step for score-based distillation using KL divergence.
+        This function is provided for external use in training pipelines.
+        
+        Args:
+            student_score: Score function from student model
+            teacher_score: Score function from teacher model
+            x_t: Noised coordinates at timestep t
+            timestep: Current timestep (1-indexed)
+            
+        Returns:
+            KL divergence loss
+        """
+        # Convert to 0-indexed for scheduler
+        t_idx = timestep - 1
+        
+        # Get noise parameters for this timestep
+        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+        
+        # Weight for the score discrepancy
+        # This weight matches the variance of the forward process
+        weight = beta_t
+        
+        # KL divergence for diffusion models simplifies to weighted MSE between scores
+        kl_loss = weight * torch.mean(torch.sum(
+            (student_score - teacher_score) ** 2, dim=-1
+        ))
+        
+        return kl_loss
     
     def compute_teacher_prediction(self, batch):
         """
