@@ -157,10 +157,23 @@ class RFDiffusionDistiller:
             'config_dict': self.config_dict
         }, path)
     
-    def _synthesize_diffusion_step(self, protein_length=150, timestep=10):
+    def get_noise_level(self, timestep):
         """
-        Synthesize a diffusion step without using the diffuser directly
-        This avoids device compatibility issues
+        Helper method to get the noise level at a specific timestep
+        
+        Args:
+            timestep: Current timestep (1-indexed)
+            
+        Returns:
+            Noise level for this timestep
+        """
+        # Convert to 0-indexed for scheduler
+        t_idx = timestep - 1
+        return torch.sqrt(self.diffuser.eucl_diffuser.beta_schedule[t_idx])
+        
+    def _get_diffusion_step(self, protein_length=150, timestep=10):
+        """
+        Get a proper diffusion step using the diffuser and score function
         
         Args:
             protein_length: Length of protein
@@ -173,16 +186,141 @@ class RFDiffusionDistiller:
         seq = torch.full((protein_length,), 21, dtype=torch.long, device=self.device)
         seq = F.one_hot(seq, num_classes=22).float()  # [L,22]
         
-        # Create random backbone coordinates
-        # These are just placeholders for our distillation purpose
-        # In a real scenario, you would use properly diffused coordinates
-        x_t = torch.randn(protein_length, 14, 3, device=self.device)
+        # Create initial noise for x_t
+        # Scale by crd_scale as in the RFDiffusion model
+        x_t = torch.randn(protein_length, 14, 3, device=self.device) * self.crd_scale
         
-        # Create x_t-1 as a slightly less noised version
-        noise_scale = 0.9 if timestep > 5 else 0.5
-        x_prev = x_t + noise_scale * torch.randn_like(x_t)
+        # Compute score function (gradient of log probability) at timestep t
+        score = self.compute_score(seq, x_t, timestep)
+        
+        # Apply score to get x_{t-1} using the proper posterior sampling rule
+        x_prev = self.apply_score_update(x_t, score, timestep)
         
         return x_t, x_prev, seq
+        
+    def compute_score(self, seq, x_t, timestep):
+        """
+        Compute score function (gradient of log probability) at current state
+        
+        Args:
+            seq: One-hot encoded sequence
+            x_t: Coordinates at time t
+            timestep: Current timestep
+            
+        Returns:
+            Score function output (gradient)
+        """
+        # Create diffusion mask (all False to diffuse all residues)
+        L = seq.shape[0]
+        diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+        
+        # Preprocess for model input
+        batch = self._preprocess(seq, x_t, timestep, diffusion_mask)
+        
+        # Get model prediction
+        with torch.no_grad():
+            msa_masked = batch['msa_masked']
+            msa_full = batch['msa_full']
+            seq_batch = batch['seq']
+            xyz_prev = batch['xyz_prev']
+            idx_pdb = batch['idx_pdb']
+            t1d = batch['t1d']
+            t2d = batch['t2d']
+            xyz_t_batch = batch['xyz_t']
+            alpha_t = batch['alpha_t']
+            
+            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.teacher_model(
+                msa_masked,
+                msa_full,
+                seq_batch,
+                xyz_prev,
+                idx_pdb,
+                t1d=t1d,
+                t2d=t2d,
+                xyz_t=xyz_t_batch,
+                alpha_t=alpha_t,
+                msa_prev=None,
+                pair_prev=None,
+                state_prev=None,
+                t=torch.tensor(timestep, device=self.device),
+                return_infer=True,
+                motif_mask=diffusion_mask
+            )
+            
+            # Process the output to get full atom coordinates
+            _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
+            px0_full = px0_full.squeeze()[:, :14]
+            
+            # The model predicts x0, and we need to calculate the score function
+            # In diffusion models, the score is the gradient of the log probability
+            # For variance exploding (VE) SDE, the score can be approximated as:
+            # score = (predicted_x0 - x_t) / sigma_t^2
+            # For variance preserving (VP) SDE, it would be different
+            
+            # For RFdiffusion's Euclidean diffusion, they use a linear noise schedule
+            # Get the noise level at this timestep
+            t_idx = timestep - 1  # Convert to 0-indexed
+            beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+            alpha_t = self.diffuser.eucl_diffuser.alpha_schedule[t_idx]
+            alpha_bar_t = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx]
+            
+            # Calculate the score estimate (gradient of log probability)
+            # For this type of diffusion model:
+            # score = (x_0 - sqrt(1-alpha_bar_t) * x_t) / (sigma_t^2)
+            # where sigma_t^2 = beta_t * (1-alpha_bar_{t-1})/(1-alpha_bar_t)
+            
+            score = (px0_full - x_t) / beta_t
+            
+            return score
+    
+    def apply_score_update(self, x_t, score, timestep):
+        """
+        Apply score function update to get x_{t-1} following the reverse diffusion process
+        
+        Args:
+            x_t: Coordinates at time t
+            score: Score function output
+            timestep: Current timestep
+            
+        Returns:
+            x_{t-1}
+        """
+        # Get diffusion parameters for this timestep (0-indexed)
+        t_idx = timestep - 1  # Convert to 0-indexed
+        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+        alpha_t = self.diffuser.eucl_diffuser.alpha_schedule[t_idx]
+        alpha_bar_t = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx]
+        
+        # Get parameters for previous timestep
+        alpha_bar_prev = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx-1] if t_idx > 0 else torch.tensor(1.0, device=self.device)
+        
+        # Calculate posterior variance (beta_tilde)
+        # Formula: beta_tilde_t = (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t) * beta_t
+        posterior_variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_t
+        
+        # Calculate posterior mean coefficient for x_t
+        # Formula: (sqrt(alpha_t) * (1 - alpha_bar_{t-1})/(1 - alpha_bar_t))
+        posterior_mean_coef1 = torch.sqrt(alpha_t) * (1 - alpha_bar_prev) / (1 - alpha_bar_t)
+        
+        # Calculate posterior mean coefficient for x_0
+        # Formula: (sqrt(alpha_bar_{t-1}) * beta_t) / (1 - alpha_bar_t)
+        posterior_mean_coef2 = torch.sqrt(alpha_bar_prev) * beta_t / (1 - alpha_bar_t)
+        
+        # Calculate predicted x_0 from score and current x_t
+        # For Euclidean diffusion with linear schedule
+        # x_0 = x_t + beta_t * score
+        predicted_x0 = x_t + beta_t * score
+        
+        # Calculate the mean of the posterior distribution
+        # mu_t = posterior_mean_coef1 * x_t + posterior_mean_coef2 * x_0
+        posterior_mean = posterior_mean_coef1 * x_t + posterior_mean_coef2 * predicted_x0
+        
+        # Sample from the posterior distribution
+        # x_{t-1} ~ N(posterior_mean, posterior_variance * I)
+        posterior_noise = torch.randn_like(x_t) * torch.sqrt(posterior_variance)
+        x_prev = posterior_mean + posterior_noise
+        
+        return x_prev
         
     def get_single_diffusion_step(self, protein_length=150, timestep=10):
         """
@@ -199,8 +337,8 @@ class RFDiffusionDistiller:
             # Create a diffusion mask (all False to diffuse all residues)
             diffusion_mask = torch.zeros(protein_length, dtype=torch.bool, device=self.device)
             
-            # Synthesize diffusion step
-            x_t, x_t_prev, seq_t = self._synthesize_diffusion_step(protein_length, timestep)
+            # Get proper diffusion step with score function
+            x_t, x_t_prev, seq_t = self._get_diffusion_step(protein_length, timestep)
             
             # Preprocess for model input
             batch = self._preprocess(seq_t, x_t, timestep, diffusion_mask)
@@ -475,7 +613,7 @@ class RFDiffusionDistiller:
 
     def encode_trajectory(self, protein_length=150, num_steps=None, include_x0=True):
         """
-        Generate a full diffusion trajectory for encoding
+        Generate a full diffusion trajectory for encoding using the score function
         
         Args:
             protein_length: Length of the protein
@@ -488,27 +626,47 @@ class RFDiffusionDistiller:
         with torch.no_grad():
             if num_steps is None:
                 num_steps = self.T
+                
+            # Create initial noised state x_T
+            x_T = torch.randn(protein_length, 14, 3, device=self.device) * self.crd_scale
             
-            # For simplicity, we'll synthesize this instead of using the actual diffuser
+            # Create sequence (all masked)
+            seq = torch.full((protein_length,), 21, dtype=torch.long, device=self.device)
+            seq = F.one_hot(seq, num_classes=22).float()
+            
+            # Setup trajectory dict
             trajectory = {
-                'x_t': [],
-                'timesteps': list(range(1, num_steps + 1)),
-                'seq': torch.full((protein_length,), 21, dtype=torch.long, device=self.device),
+                'x_t': [x_T],  # Start with x_T
+                'timesteps': list(range(self.T, 0, -1))[:num_steps],  # Count down from T to 1
+                'seq': seq,
                 'diffusion_mask': torch.zeros(protein_length, dtype=torch.bool, device=self.device)
             }
             
-            trajectory['seq'] = F.one_hot(trajectory['seq'], num_classes=22).float()
-            
-            # Create some random trajectories as placeholders
-            for t in range(1, num_steps + 1):
-                # More noise for earlier timesteps
-                noise_scale = t / num_steps
-                x_t = noise_scale * torch.randn(protein_length, 14, 3, device=self.device)
-                trajectory['x_t'].append(x_t)
+            # Starting from x_T, generate states x_{T-1}, x_{T-2}, etc. using score function
+            x_t = x_T
+            for t in range(self.T, max(self.T - num_steps, 0), -1):
+                # Compute score for current state
+                score = self.compute_score(seq, x_t, t)
                 
+                # Apply score to get x_{t-1}
+                x_t = self.apply_score_update(x_t, score, t)
+                
+                # Add to trajectory if within the desired number of steps
+                if t > self.T - num_steps:
+                    trajectory['x_t'].append(x_t)
+            
+            # Reverse the order to go from t=1 to t=T for consistency with timesteps
+            trajectory['x_t'] = trajectory['x_t'][::-1]
+            
             if include_x0:
-                # Just a clean-looking structure as a demonstration
-                x_0 = torch.randn(protein_length, 14, 3, device=self.device) * 0.1
+                # For x_0, we use the model's prediction at t=1
+                x_1 = trajectory['x_t'][0]  # First element is now t=1
+                score_1 = self.compute_score(seq, x_1, 1)
+                
+                # The score at t=1 gives us information about x_0
+                noise_level_1 = self.diffuser.get_noise_level(1)
+                x_0 = x_1 + (noise_level_1**2) * score_1
+                
                 trajectory['x_0'] = x_0
                 
             return trajectory
