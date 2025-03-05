@@ -235,34 +235,177 @@ class RFDiffusionDistiller:
         x_t = torch.randn(protein_length, 14, 3, device=self.device) * self.crd_scale
         
         # Compute score function (gradient of log probability) at timestep t
-        score = self.compute_score(seq, x_t, timestep)
+        score = self.compute_score(x_t, timestep, seq)
         
         # Apply score to get x_{t-1} using the proper posterior sampling rule
         x_prev = self.apply_score_update(x_t, score, timestep)
         
         return x_t, x_prev, seq
         
-    def compute_teacher_score(self, seq, x_t, timestep):
+    def compute_teacher_score(self, x_t, timestep, seq=None):
         """
         Compute teacher model's score function (gradient of log probability) at current state
         
         Args:
-            seq: One-hot encoded sequence
-            x_t: Coordinates at time t
+            x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
             timestep: Current timestep
+            seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
             
         Returns:
             Teacher model's score function output (gradient)
         """
-        # Create diffusion mask (all False to diffuse all residues)
-        L = seq.shape[0]
-        diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+        # Handle batch dimension
+        if len(x_t.shape) == 3:
+            # Add batch dimension if not present
+            x_t = x_t.unsqueeze(0)
+            single_item = True
+        else:
+            single_item = False
+            
+        # Move to device if needed
+        if x_t.device != self.device:
+            x_t = x_t.to(self.device)
+            
+        B, L = x_t.shape[:2]
         
-        # Preprocess for model input
-        batch = self._preprocess(seq, x_t, timestep, diffusion_mask)
+        # Process each batch item
+        all_scores = []
         
-        # Get teacher model prediction
-        with torch.no_grad():
+        for b in range(B):
+            # Create or use sequence
+            if seq is None:
+                # Create a masked sequence (all unknown residues)
+                item_seq = torch.full((L,), 21, dtype=torch.long, device=self.device)
+                item_seq = F.one_hot(item_seq, num_classes=22).float()  # [L, 22]
+            else:
+                # Use provided sequence
+                if len(seq.shape) == 2 and seq.shape[0] == L:
+                    # Single sequence for all batch items
+                    item_seq = seq
+                elif len(seq.shape) == 3:
+                    # Batch of sequences
+                    item_seq = seq[b]
+                else:
+                    raise ValueError(f"Invalid sequence shape: {seq.shape}")
+                
+                # Move to device if needed
+                if item_seq.device != self.device:
+                    item_seq = item_seq.to(self.device)
+            
+            # Create diffusion mask (all False to diffuse all residues)
+            diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+            
+            # Preprocess for model input
+            batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask)
+            
+            # Get teacher model prediction
+            with torch.no_grad():
+                msa_masked = batch['msa_masked']
+                msa_full = batch['msa_full']
+                seq_batch = batch['seq']
+                xyz_prev = batch['xyz_prev']
+                idx_pdb = batch['idx_pdb']
+                t1d = batch['t1d']
+                t2d = batch['t2d']
+                xyz_t_batch = batch['xyz_t']
+                alpha_t = batch['alpha_t']
+                
+                msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.teacher_model(
+                    msa_masked,
+                    msa_full,
+                    seq_batch,
+                    xyz_prev,
+                    idx_pdb,
+                    t1d=t1d,
+                    t2d=t2d,
+                    xyz_t=xyz_t_batch,
+                    alpha_t=alpha_t,
+                    msa_prev=None,
+                    pair_prev=None,
+                    state_prev=None,
+                    t=torch.tensor(timestep, device=self.device),
+                    return_infer=True,
+                    motif_mask=diffusion_mask
+                )
+                
+                # Process the output to get full atom coordinates
+                _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
+                px0_full = px0_full.squeeze()[:, :14]
+                
+                # Calculate score from teacher's predicted x0
+                t_idx = timestep - 1  # Convert to 0-indexed
+                beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+                
+                # Calculate the score estimate (gradient of log probability)
+                score = (px0_full - x_t[b]) / beta_t
+                all_scores.append(score)
+        
+        # Stack all scores
+        batched_score = torch.stack(all_scores)
+        
+        # Remove batch dimension if input was a single item
+        if single_item:
+            batched_score = batched_score.squeeze(0)
+            
+        return batched_score
+    
+    def compute_student_score(self, x_t, timestep, seq=None):
+        """
+        Compute student model's score function (gradient of log probability) at current state
+        
+        Args:
+            x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
+            timestep: Current timestep
+            seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
+            
+        Returns:
+            Student model's score function output (gradient)
+        """
+        # Handle batch dimension
+        if len(x_t.shape) == 3:
+            # Add batch dimension if not present
+            x_t = x_t.unsqueeze(0)
+            single_item = True
+        else:
+            single_item = False
+            
+        # Move to device if needed
+        if x_t.device != self.device:
+            x_t = x_t.to(self.device)
+            
+        B, L = x_t.shape[:2]
+        
+        # Process each batch item
+        all_scores = []
+        
+        for b in range(B):
+            # Create or use sequence
+            if seq is None:
+                # Create a masked sequence (all unknown residues)
+                item_seq = torch.full((L,), 21, dtype=torch.long, device=self.device)
+                item_seq = F.one_hot(item_seq, num_classes=22).float()  # [L, 22]
+            else:
+                # Use provided sequence
+                if len(seq.shape) == 2 and seq.shape[0] == L:
+                    # Single sequence for all batch items
+                    item_seq = seq
+                elif len(seq.shape) == 3:
+                    # Batch of sequences
+                    item_seq = seq[b]
+                else:
+                    raise ValueError(f"Invalid sequence shape: {seq.shape}")
+                
+                # Move to device if needed
+                if item_seq.device != self.device:
+                    item_seq = item_seq.to(self.device)
+            
+            # Create diffusion mask (all False to diffuse all residues)
+            diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+            
+            # Preprocess for model input
+            batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask)
+            
+            # Get student model prediction
             msa_masked = batch['msa_masked']
             msa_full = batch['msa_full']
             seq_batch = batch['seq']
@@ -273,7 +416,7 @@ class RFDiffusionDistiller:
             xyz_t_batch = batch['xyz_t']
             alpha_t = batch['alpha_t']
             
-            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.teacher_model(
+            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.student_model(
                 msa_masked,
                 msa_full,
                 seq_batch,
@@ -295,95 +438,37 @@ class RFDiffusionDistiller:
             _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
             px0_full = px0_full.squeeze()[:, :14]
             
-            # Calculate score from teacher's predicted x0
+            # Calculate score from student's predicted x0
             t_idx = timestep - 1  # Convert to 0-indexed
             beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
             
-            # Calculate the score estimate (gradient of log probability)
-            score = (px0_full - x_t) / beta_t
+            # Calculate the score estimate
+            score = (px0_full - x_t[b]) / beta_t
+            all_scores.append(score)
+        
+        # Stack all scores
+        batched_score = torch.stack(all_scores)
+        
+        # Remove batch dimension if input was a single item
+        if single_item:
+            batched_score = batched_score.squeeze(0)
             
-            # Return score on the original device
-            original_device = seq.device
-            if score.device != original_device:
-                score = score.to(original_device)
-                
-            return score
-    
-    def compute_student_score(self, seq, x_t, timestep):
-        """
-        Compute student model's score function (gradient of log probability) at current state
+        return batched_score
         
-        Args:
-            seq: One-hot encoded sequence
-            x_t: Coordinates at time t
-            timestep: Current timestep
-            
-        Returns:
-            Student model's score function output (gradient)
-        """
-        # Create diffusion mask (all False to diffuse all residues)
-        L = seq.shape[0]
-        diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
-        
-        # Preprocess for model input
-        batch = self._preprocess(seq, x_t, timestep, diffusion_mask)
-        
-        # Get student model prediction
-        msa_masked = batch['msa_masked']
-        msa_full = batch['msa_full']
-        seq_batch = batch['seq']
-        xyz_prev = batch['xyz_prev']
-        idx_pdb = batch['idx_pdb']
-        t1d = batch['t1d']
-        t2d = batch['t2d']
-        xyz_t_batch = batch['xyz_t']
-        alpha_t = batch['alpha_t']
-        
-        msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.student_model(
-            msa_masked,
-            msa_full,
-            seq_batch,
-            xyz_prev,
-            idx_pdb,
-            t1d=t1d,
-            t2d=t2d,
-            xyz_t=xyz_t_batch,
-            alpha_t=alpha_t,
-            msa_prev=None,
-            pair_prev=None,
-            state_prev=None,
-            t=torch.tensor(timestep, device=self.device),
-            return_infer=True,
-            motif_mask=diffusion_mask
-        )
-        
-        # Process the output to get full atom coordinates
-        _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
-        px0_full = px0_full.squeeze()[:, :14]
-        
-        # Calculate score from student's predicted x0
-        t_idx = timestep - 1  # Convert to 0-indexed
-        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
-        
-        # Calculate the score estimate
-        score = (px0_full - x_t) / beta_t
-        
-        return score
-        
-    def compute_score(self, seq, x_t, timestep):
+    def compute_score(self, x_t, timestep, seq=None):
         """
         Compute score function (gradient of log probability) at current state
         This is a convenience method that uses the teacher model by default
         
         Args:
-            seq: One-hot encoded sequence
             x_t: Coordinates at time t
             timestep: Current timestep
+            seq: Optional sequence information. If None, a masked sequence will be created.
             
         Returns:
             Score function output (gradient) from the teacher model
         """
-        return self.compute_teacher_score(seq, x_t, timestep)
+        return self.compute_teacher_score(x_t, timestep, seq)
     
     def apply_score_update(self, x_t, score, timestep):
         """
