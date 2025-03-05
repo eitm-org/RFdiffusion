@@ -15,6 +15,13 @@ def main():
         model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
                                  "model_weights/Base_ckpt.pt")
         
+        # Note on GPU usage:
+        # To manage GPU memory usage, it's best to use CUDA_VISIBLE_DEVICES before running the script.
+        # Examples:
+        #   - To use only GPU 0: CUDA_VISIBLE_DEVICES=0 python example_distillation.py
+        #   - To use no GPU (CPU only): CUDA_VISIBLE_DEVICES= python example_distillation.py
+        #   - To use multiple GPUs, use PyTorch DataParallel or DistributedDataParallel
+        
         distiller = RFDiffusionDistiller(
             teacher_ckpt_path=model_path
         )

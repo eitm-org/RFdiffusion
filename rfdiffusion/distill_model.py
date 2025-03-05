@@ -32,7 +32,7 @@ class RFDiffusionDistiller:
         self._log = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
         
-        # Set device
+        # Set device - use CUDA_VISIBLE_DEVICES to control which GPUs are available
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self._log.info(f"Using device: {self.device}")
         
@@ -87,6 +87,7 @@ class RFDiffusionDistiller:
         Returns:
             The initialized model
         """
+        
         # Get model config from checkpoint
         model_config = self.config_dict['model'].copy()
         
@@ -131,6 +132,7 @@ class RFDiffusionDistiller:
     def setup_diffuser(self):
         """
         Setup the diffuser with parameters from the checkpoint
+        Diffuser will be placed on the teacher device
         """
         # Get diffuser config
         diffuser_config = self.config_dict['diffuser']
@@ -182,6 +184,7 @@ class RFDiffusionDistiller:
         Returns:
             x_t, x_prev, seq
         """
+            
         # Create sequence (all masked)
         seq = torch.full((protein_length,), 21, dtype=torch.long, device=self.device)
         seq = F.one_hot(seq, num_classes=22).float()  # [L,22]
@@ -258,6 +261,11 @@ class RFDiffusionDistiller:
             # Calculate the score estimate (gradient of log probability)
             score = (px0_full - x_t) / beta_t
             
+            # Return score on the original device
+            original_device = seq.device
+            if score.device != original_device:
+                score = score.to(original_device)
+                
             return score
     
     def compute_student_score(self, seq, x_t, timestep):
@@ -501,6 +509,7 @@ class RFDiffusionDistiller:
         Returns:
             2D features
         """
+            
         # This is a simplified placeholder
         # In practice, use the actual implementation from RFdiffusion
         B, T, L = xyz.shape[:3]
