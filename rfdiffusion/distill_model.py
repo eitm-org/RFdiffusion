@@ -451,6 +451,11 @@ class RFDiffusionDistiller:
         # Process each batch item
         all_scores = []
         
+        # Determine if we need gradients
+        # For the teacher model, NEVER track gradients (it's frozen)
+        # For the student or generator, track gradients ONLY if model is in training mode
+        requires_grad = model is not self.teacher_model and model.training
+        
         for b in range(B):
             # Create or use sequence
             if seq is None:
@@ -475,7 +480,7 @@ class RFDiffusionDistiller:
             batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask, device=model_device)
             
             # Model forward pass
-            with torch.set_grad_enabled(not (model is self.teacher_model)):  # No gradients for teacher
+            with torch.set_grad_enabled(requires_grad):
                 msa_masked = batch['msa_masked']
                 msa_full = batch['msa_full']
                 seq_batch = batch['seq']
@@ -505,16 +510,22 @@ class RFDiffusionDistiller:
                 )
                 
                 # Process the output to get full atom coordinates
-                _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1).to(self.default_device), 
-                                          px0.to(self.default_device), 
-                                          alpha.to(self.default_device))
-                px0_full = px0_full.squeeze()[:, :14].to(model_device)
+                with torch.no_grad():  # Always detach here to avoid gradient issues
+                    _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1).to(self.default_device), 
+                                              px0.to(self.default_device), 
+                                              alpha.to(self.default_device))
+                    px0_full = px0_full.squeeze()[:, :14].to(model_device)
                 
                 # Get diffusion parameters for this device
                 params = self._get_device_params(model_device, timestep)
                 
                 # Calculate the score estimate
-                score = (px0_full - x_t[b]) / params['beta_t']
+                # If we're computing for teacher, always detach to avoid gradient flow
+                if model is self.teacher_model:
+                    score = ((px0_full - x_t[b]) / params['beta_t']).detach()
+                else:
+                    score = (px0_full - x_t[b]) / params['beta_t']
+                    
                 all_scores.append(score)
         
         # Stack all scores
@@ -742,15 +753,19 @@ class RFDiffusionDistiller:
         if device is None:
             device = pred_score.device if hasattr(pred_score, 'device') else self.default_device
             
+        # IMPORTANT: Ensure the target score is detached to prevent backward through both models
+        # This is crucial for separating student and generator gradients
+        target_score_detached = target_score.detach()
+            
         # Move tensors to the same device if needed
         if pred_score.device != device:
             pred_score = pred_score.to(device)
             
-        if target_score.device != device:
-            target_score = target_score.to(device)
+        if target_score_detached.device != device:
+            target_score_detached = target_score_detached.to(device)
             
         # Use MSE loss for score matching
-        return F.mse_loss(pred_score, target_score)
+        return F.mse_loss(pred_score, target_score_detached)
     
     def compute_rfdiffusion_loss(self, pred, target, seq=None, w2D=0.5, device=None):
         """
@@ -1380,12 +1395,20 @@ class RFDiffusionDistiller:
         if device is None:
             device = student_score.device if hasattr(student_score, 'device') else self.default_device
             
-        # Move tensors to the same device if needed
-        if student_score.device != device:
-            student_score = student_score.to(device)
+        # IMPORTANT: Detach the student_score to avoid backward through both models
+        # This ensures separate backward passes for student and generator
+        student_score_detached = student_score.detach()
+        
+        # Teacher score is already detached since it's computed with no_grad
+        # But detach again explicitly to be safe
+        teacher_score_detached = teacher_score.detach()
             
-        if teacher_score.device != device:
-            teacher_score = teacher_score.to(device)
+        # Move tensors to the same device if needed
+        if student_score_detached.device != device:
+            student_score_detached = student_score_detached.to(device)
+            
+        if teacher_score_detached.device != device:
+            teacher_score_detached = teacher_score_detached.to(device)
             
         # Get device-specific diffusion parameters
         params = self._get_device_params(device, timestep)
@@ -1396,13 +1419,14 @@ class RFDiffusionDistiller:
         
         try:
             # KL divergence for diffusion models simplifies to weighted MSE between scores
+            # Use the same input but DETACHED versions of the other scores
             kl_loss = weight * torch.mean(torch.sum(
-                (student_score - teacher_score) ** 2, dim=-1
+                (student_score - teacher_score_detached) ** 2, dim=-1
             ))
         except RuntimeError as e:
             # Log error and provide fallback
             self._log.warning(f"Error computing KL loss: {e}")
             # Use regular MSE loss as fallback
-            kl_loss = F.mse_loss(student_score, teacher_score)
+            kl_loss = F.mse_loss(student_score, teacher_score_detached)
         
         return kl_loss
