@@ -23,7 +23,7 @@ class RFDiffusionDistiller:
     """
     
     def __init__(self, config_path=None, teacher_ckpt_path=None, student_ckpt_path=None, 
-                 generator_ckpt_path=None):
+                 generator_ckpt_path=None, device_map=None):
         """
         Initialize the distiller with teacher, student, and generator models
         
@@ -32,21 +32,32 @@ class RFDiffusionDistiller:
             teacher_ckpt_path: Path to the teacher checkpoint
             student_ckpt_path: Path to the student checkpoint (optional)
             generator_ckpt_path: Path to the generator checkpoint (optional)
+            device_map: Dictionary mapping model names to devices ('teacher', 'student', 'generator')
+                        Example: {'teacher': 'cuda:0', 'student': 'cuda:1', 'generator': 'cuda:1'}
+                        If None, all models will be placed on the same device
         """
         # Configure logging
         self._log = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
         
-        # Set device - use CUDA_VISIBLE_DEVICES to control which GPUs are available
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self._log.info(f"Using device: {self.device}")
+        # Get available devices
+        self.cuda_available = torch.cuda.is_available()
+        self.num_gpus = torch.cuda.device_count() if self.cuda_available else 0
+        self._log.info(f"Found {self.num_gpus} CUDA devices")
+        
+        # Set default device
+        self.default_device = torch.device('cuda:0' if self.cuda_available else 'cpu')
+        
+        # Setup device map
+        self.device_map = self._setup_device_map(device_map)
+        self._log.info(f"Using device map: {self.device_map}")
         
         # Path for teacher model
         ckpt_path = teacher_ckpt_path or "models/Base_ckpt.pt"
         self._log.info(f"Loading checkpoint from {ckpt_path}")
         
         # Load teacher checkpoint directly
-        self.ckpt = torch.load(ckpt_path, map_location=self.device)
+        self.ckpt = torch.load(ckpt_path, map_location=self.device_map['teacher'])
         
         # Setup configuration with values from the model checkpoint
         self._log.info("Setting up configuration from checkpoint")
@@ -57,54 +68,123 @@ class RFDiffusionDistiller:
         self.setup_diffuser()
         
         # Create the teacher model
-        self._log.info("Creating teacher model")
-        self.teacher_model = self.setup_model(is_teacher=True)
+        self._log.info(f"Creating teacher model on {self.device_map['teacher']}")
+        self.teacher_model = self.setup_model(is_teacher=True, device=self.device_map['teacher'])
         
         # Create the student model
-        self._log.info("Creating student model")
-        self.student_model = self.setup_model(is_teacher=False)
+        self._log.info(f"Creating student model on {self.device_map['student']}")
+        self.student_model = self.setup_model(is_teacher=False, device=self.device_map['student'])
         
-        # Create the generator model (initially a copy of the student)
-        self._log.info("Creating generator model")
-        self.generator_model = self.setup_model(is_teacher=False)
+        # Create the generator model
+        self._log.info(f"Creating generator model on {self.device_map['generator']}")
+        self.generator_model = self.setup_model(is_teacher=False, device=self.device_map['generator'])
             
         # Load model weights
         if student_ckpt_path is not None:
             self._log.info(f"Loading student weights from {student_ckpt_path}")
-            student_ckpt = torch.load(student_ckpt_path, map_location=self.device)
+            student_ckpt = torch.load(student_ckpt_path, map_location=self.device_map['student'])
             self.student_model.load_state_dict(student_ckpt['model_state_dict'], strict=True)
         else:
             self._log.info("Initializing student with teacher weights")
-            self.student_model.load_state_dict(self.teacher_model.state_dict())
+            # Cross-device state dict copy
+            self._copy_state_dict(self.teacher_model, self.student_model)
             
         if generator_ckpt_path is not None:
             self._log.info(f"Loading generator weights from {generator_ckpt_path}")
-            generator_ckpt = torch.load(generator_ckpt_path, map_location=self.device)
+            generator_ckpt = torch.load(generator_ckpt_path, map_location=self.device_map['generator'])
             self.generator_model.load_state_dict(generator_ckpt['model_state_dict'], strict=True)
         else:
             self._log.info("Initializing generator with student weights")
-            self.generator_model.load_state_dict(self.student_model.state_dict())
+            # Cross-device state dict copy
+            self._copy_state_dict(self.student_model, self.generator_model)
             
         # Set model modes
         self.teacher_model.eval()  # Teacher is always frozen
         self.student_model.train()
         self.generator_model.train()
         
-        # Initialize the all-atom coordinate calculator
-        self.allatom = ComputeAllAtomCoords().to(self.device)
+        # Initialize the all-atom coordinate calculator (on the default device)
+        self.allatom = ComputeAllAtomCoords().to(self.default_device)
         
         self._log.info("Initialized RFDiffusionDistiller successfully")
     
-    def setup_model(self, is_teacher=False):
+    def _setup_device_map(self, device_map=None):
+        """
+        Set up device mapping for the models
+        
+        Args:
+            device_map: Dictionary mapping model names to devices
+            
+        Returns:
+            Complete device map dictionary
+        """
+        # If no device map provided, create a default one
+        if device_map is None:
+            device_map = {}
+            
+        # Set defaults for any unspecified models
+        if self.num_gpus >= 2:
+            # Multi-GPU setup if available
+            default_map = {
+                'teacher': 'cuda:0',  # Teacher on first GPU
+                'student': 'cuda:1',  # Student on second GPU
+                'generator': 'cuda:1'  # Generator on second GPU
+            }
+        else:
+            # Single GPU or CPU setup
+            device_str = 'cuda:0' if self.cuda_available else 'cpu'
+            default_map = {
+                'teacher': device_str,
+                'student': device_str,
+                'generator': device_str
+            }
+            
+        # Update defaults with any provided values
+        for key, value in device_map.items():
+            default_map[key] = value
+            
+        # Convert string device specifications to torch devices
+        return {k: torch.device(v) for k, v in default_map.items()}
+    
+    def _copy_state_dict(self, source_model, target_model):
+        """
+        Copy state dict between models that might be on different devices
+        
+        Args:
+            source_model: Source model
+            target_model: Target model
+        """
+        for name, param in source_model.state_dict().items():
+            target_model.state_dict()[name].copy_(param.to(target_model.device))
+    
+    def to_device(self, tensor, device_name):
+        """
+        Move a tensor to the specified device
+        
+        Args:
+            tensor: Tensor to move
+            device_name: Name of the device in the device map ('teacher', 'student', 'generator')
+            
+        Returns:
+            Tensor on the specified device
+        """
+        target_device = self.device_map.get(device_name, self.default_device)
+        return tensor.to(target_device)
+    
+    def setup_model(self, is_teacher=False, device=None):
         """
         Setup the model with parameters from the checkpoint
         
         Args:
             is_teacher: Whether this is the teacher model (which loads weights and is frozen)
+            device: Device to place the model on
             
         Returns:
             The initialized model
         """
+        # If no device specified, use default
+        if device is None:
+            device = self.default_device
         
         # Get model config from checkpoint
         model_config = self.config_dict['model'].copy()
@@ -129,12 +209,18 @@ class RFDiffusionDistiller:
             if param in model_config:
                 del model_config[param]
                 
-        # Create model
-        model = RoseTTAFoldModule(**model_config, d_t1d=d_t1d, d_t2d=d_t2d, T=T).to(self.device)
+        # Create model on specified device
+        model = RoseTTAFoldModule(**model_config, d_t1d=d_t1d, d_t2d=d_t2d, T=T).to(device)
+        
+        # Set model's device attribute for easier reference
+        model.device = device
         
         # Load weights for teacher model only
         if is_teacher:
-            model.load_state_dict(self.ckpt['model_state_dict'], strict=True)
+            self._log.info(f"Loading teacher weights to {device}")
+            # Load weights directly to the correct device
+            state_dict = {k: v.to(device) for k, v in self.ckpt['model_state_dict'].items()}
+            model.load_state_dict(state_dict, strict=True)
             model.eval()  # Teacher is always frozen
         else:
             model.train()  # Student/Generator are trainable
@@ -144,7 +230,7 @@ class RFDiffusionDistiller:
     def setup_diffuser(self):
         """
         Setup the diffuser with parameters from the checkpoint
-        Diffuser will be placed on the teacher device
+        Diffuser parameters will be accessible from any device
         """
         # Get diffuser config
         diffuser_config = self.config_dict['diffuser']
@@ -158,6 +244,9 @@ class RFDiffusionDistiller:
         # Store important parameters
         self.T = diffuser_config['T']
         self.crd_scale = diffuser_config['crd_scale']
+        
+        # Cache key diffusion parameters on all devices for faster access
+        self._setup_diffusion_cache()
     
     def save_model(self, model, path):
         """
@@ -186,7 +275,7 @@ class RFDiffusionDistiller:
         t_idx = timestep - 1
         return torch.sqrt(self.diffuser.eucl_diffuser.beta_schedule[t_idx])
         
-    def add_noise(self, x_0, timestep, noise=None):
+    def add_noise(self, x_0, timestep, noise=None, device=None):
         """
         Add noise to protein coordinates for a specific timestep.
         This function is provided for external use in training pipelines.
@@ -195,36 +284,102 @@ class RFDiffusionDistiller:
             x_0: Clean protein coordinates [B, L, 14, 3] or [L, 14, 3]
             timestep: Timestep (1-indexed) to noise to 
             noise: Optional pre-generated noise; if None, random noise will be generated
+            device: Device to place results on; if None, uses x_0's device
             
         Returns:
             x_t: Noised coordinates at timestep t
             noise: The noise that was added (for calculating targets in training)
         """
+        # Determine which device to use
+        if device is None:
+            device = x_0.device
+            
+        # If x_0 is not on the desired device, move it
+        if x_0.device != device:
+            x_0 = x_0.to(device)
+            
         # Add batch dimension if not present
         if len(x_0.shape) == 3:
             x_0 = x_0.unsqueeze(0)
             
         B, L = x_0.shape[:2]
         
-        # Convert to 0-indexed for scheduler
-        t_idx = timestep - 1
-        
-        # Get noise parameters for this timestep
-        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
-        alpha_t = self.diffuser.eucl_diffuser.alpha_schedule[t_idx]
-        alpha_bar_t = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx]
+        # Get diffusion parameters for this device
+        params = self._get_device_params(device, timestep)
         
         # Generate noise if not provided
         if noise is None:
-            noise = torch.randn_like(x_0, device=self.device)
+            noise = torch.randn_like(x_0, device=device)
+        elif noise.device != device:
+            noise = noise.to(device)
             
         # Apply noise schedule following the forward diffusion process
         # For variance preserving (VP) SDE:
         # x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
-        x_t = torch.sqrt(alpha_bar_t) * x_0 + torch.sqrt(1 - alpha_bar_t) * noise
+        x_t = torch.sqrt(params['alpha_bar_t']) * x_0 + torch.sqrt(1 - params['alpha_bar_t']) * noise
         
         return x_t, noise
         
+    def _setup_diffusion_cache(self):
+        """
+        Cache diffusion parameters on each device for faster access
+        """
+        # Create device-specific caches
+        self.device_caches = {}
+        
+        # For each device in the device map
+        for device_name, device in self.device_map.items():
+            # Create cache for this device
+            device_cache = {
+                'beta_schedule': self.diffuser.eucl_diffuser.beta_schedule.to(device),
+                'alpha_schedule': self.diffuser.eucl_diffuser.alpha_schedule.to(device),
+                'alphabar_schedule': self.diffuser.eucl_diffuser.alphabar_schedule.to(device)
+            }
+            self.device_caches[device] = device_cache
+            
+        # Also cache on default device if not already included
+        if self.default_device not in self.device_caches:
+            device_cache = {
+                'beta_schedule': self.diffuser.eucl_diffuser.beta_schedule.to(self.default_device),
+                'alpha_schedule': self.diffuser.eucl_diffuser.alpha_schedule.to(self.default_device),
+                'alphabar_schedule': self.diffuser.eucl_diffuser.alphabar_schedule.to(self.default_device)
+            }
+            self.device_caches[self.default_device] = device_cache
+            
+    def _get_device_params(self, device, timestep):
+        """
+        Get diffusion parameters for a specific device and timestep
+        
+        Args:
+            device: Device to get parameters for
+            timestep: Current timestep (1-indexed)
+            
+        Returns:
+            Dictionary of diffusion parameters
+        """
+        # Get the device cache
+        cache = self.device_caches.get(device)
+        
+        # If no cache for this device, create one
+        if cache is None:
+            cache = {
+                'beta_schedule': self.diffuser.eucl_diffuser.beta_schedule.to(device),
+                'alpha_schedule': self.diffuser.eucl_diffuser.alpha_schedule.to(device),
+                'alphabar_schedule': self.diffuser.eucl_diffuser.alphabar_schedule.to(device)
+            }
+            self.device_caches[device] = cache
+            
+        # Convert to 0-indexed for scheduler
+        t_idx = timestep - 1
+        
+        # Return parameters for this timestep
+        return {
+            'beta_t': cache['beta_schedule'][t_idx],
+            'alpha_t': cache['alpha_schedule'][t_idx],
+            'alpha_bar_t': cache['alphabar_schedule'][t_idx],
+            'alpha_bar_prev': cache['alphabar_schedule'][t_idx-1] if t_idx > 0 else torch.tensor(1.0, device=device)
+        }
+    
     def compute_score(self, model, x_t, timestep, seq=None):
         """
         Compute a model's score function (gradient of log probability) at current state
@@ -238,6 +393,9 @@ class RFDiffusionDistiller:
         Returns:
             Model's score function output (gradient)
         """
+        # Determine the device this model is on
+        model_device = getattr(model, 'device', self.default_device)
+        
         # Handle batch dimension
         if len(x_t.shape) == 3:
             # Add batch dimension if not present
@@ -246,9 +404,9 @@ class RFDiffusionDistiller:
         else:
             single_item = False
             
-        # Move to device if needed
-        if x_t.device != self.device:
-            x_t = x_t.to(self.device)
+        # Move to the correct device
+        if x_t.device != model_device:
+            x_t = x_t.to(model_device)
             
         B, L = x_t.shape[:2]
         
@@ -259,28 +417,24 @@ class RFDiffusionDistiller:
             # Create or use sequence
             if seq is None:
                 # Create a masked sequence (all unknown residues)
-                item_seq = torch.full((L,), 21, dtype=torch.long, device=self.device)
+                item_seq = torch.full((L,), 21, dtype=torch.long, device=model_device)
                 item_seq = F.one_hot(item_seq, num_classes=22).float()  # [L, 22]
             else:
                 # Use provided sequence
                 if len(seq.shape) == 2 and seq.shape[0] == L:
                     # Single sequence for all batch items
-                    item_seq = seq
+                    item_seq = seq.to(model_device)
                 elif len(seq.shape) == 3:
                     # Batch of sequences
-                    item_seq = seq[b]
+                    item_seq = seq[b].to(model_device)
                 else:
                     raise ValueError(f"Invalid sequence shape: {seq.shape}")
-                
-                # Move to device if needed
-                if item_seq.device != self.device:
-                    item_seq = item_seq.to(self.device)
             
             # Create diffusion mask (all False to diffuse all residues)
-            diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
+            diffusion_mask = torch.zeros(L, dtype=torch.bool, device=model_device)
             
             # Preprocess for model input
-            batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask)
+            batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask, device=model_device)
             
             # Model forward pass
             with torch.set_grad_enabled(not (model is self.teacher_model)):  # No gradients for teacher
@@ -307,21 +461,22 @@ class RFDiffusionDistiller:
                     msa_prev=None,
                     pair_prev=None,
                     state_prev=None,
-                    t=torch.tensor(timestep, device=self.device),
+                    t=torch.tensor(timestep, device=model_device),
                     return_infer=True,
                     motif_mask=diffusion_mask
                 )
                 
                 # Process the output to get full atom coordinates
-                _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
-                px0_full = px0_full.squeeze()[:, :14]
+                _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1).to(self.default_device), 
+                                          px0.to(self.default_device), 
+                                          alpha.to(self.default_device))
+                px0_full = px0_full.squeeze()[:, :14].to(model_device)
                 
-                # Calculate score from model's predicted x0
-                t_idx = timestep - 1  # Convert to 0-indexed
-                beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+                # Get diffusion parameters for this device
+                params = self._get_device_params(model_device, timestep)
                 
                 # Calculate the score estimate
-                score = (px0_full - x_t[b]) / beta_t
+                score = (px0_full - x_t[b]) / params['beta_t']
                 all_scores.append(score)
         
         # Stack all scores
@@ -375,7 +530,7 @@ class RFDiffusionDistiller:
         """
         return self.compute_score(self.generator_model, x_t, timestep, seq)
     
-    def apply_score_update(self, x_t, score, timestep):
+    def apply_score_update(self, x_t, score, timestep, device=None):
         """
         Apply score function update to get x_{t-1} following the reverse diffusion process
         
@@ -383,35 +538,41 @@ class RFDiffusionDistiller:
             x_t: Coordinates at time t
             score: Score function output
             timestep: Current timestep
+            device: Device to place results on; if None, uses x_t's device
             
         Returns:
             x_{t-1}
         """
-        # Get diffusion parameters for this timestep (0-indexed)
-        t_idx = timestep - 1  # Convert to 0-indexed
-        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
-        alpha_t = self.diffuser.eucl_diffuser.alpha_schedule[t_idx]
-        alpha_bar_t = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx]
-        
-        # Get parameters for previous timestep
-        alpha_bar_prev = self.diffuser.eucl_diffuser.alphabar_schedule[t_idx-1] if t_idx > 0 else torch.tensor(1.0, device=self.device)
+        # Determine which device to use
+        if device is None:
+            device = x_t.device
+            
+        # If tensors are not on the desired device, move them
+        if x_t.device != device:
+            x_t = x_t.to(device)
+            
+        if score.device != device:
+            score = score.to(device)
+            
+        # Get diffusion parameters for this device
+        params = self._get_device_params(device, timestep)
         
         # Calculate posterior variance (beta_tilde)
         # Formula: beta_tilde_t = (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t) * beta_t
-        posterior_variance = (1 - alpha_bar_prev) / (1 - alpha_bar_t) * beta_t
+        posterior_variance = (1 - params['alpha_bar_prev']) / (1 - params['alpha_bar_t']) * params['beta_t']
         
         # Calculate posterior mean coefficient for x_t
         # Formula: (sqrt(alpha_t) * (1 - alpha_bar_{t-1})/(1 - alpha_bar_t))
-        posterior_mean_coef1 = torch.sqrt(alpha_t) * (1 - alpha_bar_prev) / (1 - alpha_bar_t)
+        posterior_mean_coef1 = torch.sqrt(params['alpha_t']) * (1 - params['alpha_bar_prev']) / (1 - params['alpha_bar_t'])
         
         # Calculate posterior mean coefficient for x_0
         # Formula: (sqrt(alpha_bar_{t-1}) * beta_t) / (1 - alpha_bar_t)
-        posterior_mean_coef2 = torch.sqrt(alpha_bar_prev) * beta_t / (1 - alpha_bar_t)
+        posterior_mean_coef2 = torch.sqrt(params['alpha_bar_prev']) * params['beta_t'] / (1 - params['alpha_bar_t'])
         
         # Calculate predicted x_0 from score and current x_t
         # For Euclidean diffusion with linear schedule
         # x_0 = x_t + beta_t * score
-        predicted_x0 = x_t + beta_t * score
+        predicted_x0 = x_t + params['beta_t'] * score
         
         # Calculate the mean of the posterior distribution
         # mu_t = posterior_mean_coef1 * x_t + posterior_mean_coef2 * x_0
@@ -419,12 +580,12 @@ class RFDiffusionDistiller:
         
         # Sample from the posterior distribution
         # x_{t-1} ~ N(posterior_mean, posterior_variance * I)
-        posterior_noise = torch.randn_like(x_t) * torch.sqrt(posterior_variance)
+        posterior_noise = torch.randn_like(x_t, device=device) * torch.sqrt(posterior_variance)
         x_prev = posterior_mean + posterior_noise
         
         return x_prev
             
-    def _preprocess(self, seq, xyz_t, t, diffusion_mask):
+    def _preprocess(self, seq, xyz_t, t, diffusion_mask, device=None):
         """
         Preprocess inputs for the model
         
@@ -433,27 +594,32 @@ class RFDiffusionDistiller:
             xyz_t: Coordinates at time t
             t: Timestep
             diffusion_mask: Diffusion mask
+            device: Device to place tensors on (default: self.default_device)
             
         Returns:
             Dictionary of preprocessed inputs
         """
+        # If no device specified, use seq's device
+        if device is None:
+            device = seq.device
+            
         L = seq.shape[0]
         T = self.T
                 
         # MSA features 
-        msa_masked = torch.zeros((1, 1, L, 48), device=self.device)
+        msa_masked = torch.zeros((1, 1, L, 48), device=device)
         msa_masked[:, :, :, :22] = seq[None, None]
         msa_masked[:, :, :, 22:44] = seq[None, None]
         msa_masked[:, :, 0, 46] = 1.0
         msa_masked[:, :, -1, 47] = 1.0
         
-        msa_full = torch.zeros((1, 1, L, 25), device=self.device)
+        msa_full = torch.zeros((1, 1, L, 25), device=device)
         msa_full[:, :, :, :22] = seq[None, None]
         msa_full[:, :, 0, 23] = 1.0
         msa_full[:, :, -1, 24] = 1.0
         
         # T1D features
-        t1d = torch.zeros((1, 1, L, 21), device=self.device)
+        t1d = torch.zeros((1, 1, L, 21), device=device)
         seqt1d = torch.clone(seq)
         for idx in range(L):
             if seqt1d[idx, 21] == 1:
@@ -463,7 +629,7 @@ class RFDiffusionDistiller:
         t1d[:, :, :, :21] = seqt1d[None, None, :, :21]
         
         # Timestep feature (1-t/T for non-motif residues, 1 for motif residues)
-        timefeature = torch.zeros(L, dtype=torch.float32, device=self.device)
+        timefeature = torch.zeros(L, dtype=torch.float32, device=device)
         timefeature[diffusion_mask] = 1
         timefeature[~diffusion_mask] = 1 - t/T
         timefeature = timefeature[None, None, ..., None]
@@ -478,16 +644,16 @@ class RFDiffusionDistiller:
             xyz_t_clone[mask_indices[0], 3:, :] = float('nan')
         
         xyz_t_clone = xyz_t_clone[None, None]
-        xyz_t_clone = torch.cat((xyz_t_clone, torch.full((1, 1, L, 13, 3), float('nan'), device=self.device)), dim=3)
+        xyz_t_clone = torch.cat((xyz_t_clone, torch.full((1, 1, L, 13, 3), float('nan'), device=device)), dim=3)
         
         # T2D features
-        t2d = self.xyz_to_t2d(xyz_t_clone)
+        t2d = self.xyz_to_t2d(xyz_t_clone, device)
         
         # Index features
-        idx = torch.arange(L, device=self.device)[None]
+        idx = torch.arange(L, device=device)[None]
         
         # Alpha features (placeholder for torsions)
-        alpha_t = torch.zeros((1, 1, L, 30), device=self.device)
+        alpha_t = torch.zeros((1, 1, L, 30), device=device)
         
         return {
             'msa_masked': msa_masked,
@@ -500,21 +666,26 @@ class RFDiffusionDistiller:
             'xyz_t': xyz_t_clone, 
             'alpha_t': alpha_t
         }
-    
-    def xyz_to_t2d(self, xyz):
+        
+    def xyz_to_t2d(self, xyz, device=None):
         """
         Convert xyz coordinates to 2D distance and orientation features
         
         Args:
             xyz: Coordinates
+            device: Device to place tensors on
             
         Returns:
             2D features
         """
+        # If no device specified, use xyz's device
+        if device is None:
+            device = xyz.device
+            
         # This is a simplified placeholder
         # In practice, use the actual implementation from RFdiffusion
         B, T, L = xyz.shape[:3]
-        t2d = torch.zeros((B, T, L, L, 44), device=self.device)
+        t2d = torch.zeros((B, T, L, L, 44), device=device)
         return t2d
         
     def compute_score_loss(self, pred_score, target_score):
