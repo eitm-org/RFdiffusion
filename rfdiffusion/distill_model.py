@@ -18,17 +18,20 @@ import numpy as np
 
 class RFDiffusionDistiller:
     """
-    Class for distilling/fine-tuning the RFdiffusion model into a single-shot model
+    Class for distilling/fine-tuning the RFdiffusion model into a single-shot model.
+    Provides core functionality for computing score functions and losses.
     """
     
-    def __init__(self, config_path=None, teacher_ckpt_path=None, student_ckpt_path=None):
+    def __init__(self, config_path=None, teacher_ckpt_path=None, student_ckpt_path=None, 
+                 generator_ckpt_path=None):
         """
-        Initialize the distiller with teacher and student models
+        Initialize the distiller with teacher, student, and generator models
         
         Args:
             config_path: Path to the config file
             teacher_ckpt_path: Path to the teacher checkpoint
             student_ckpt_path: Path to the student checkpoint (optional)
+            generator_ckpt_path: Path to the generator checkpoint (optional)
         """
         # Configure logging
         self._log = logging.getLogger(__name__)
@@ -55,13 +58,17 @@ class RFDiffusionDistiller:
         
         # Create the teacher model
         self._log.info("Creating teacher model")
-        self.teacher_model = self.setup_model(is_student=False)
+        self.teacher_model = self.setup_model(is_teacher=True)
         
-        # Create a student model (initially a copy of the teacher)
+        # Create the student model
         self._log.info("Creating student model")
-        self.student_model = self.setup_model(is_student=True)
+        self.student_model = self.setup_model(is_teacher=False)
         
-        # Either load provided checkpoint or copy teacher weights
+        # Create the generator model (initially a copy of the student)
+        self._log.info("Creating generator model")
+        self.generator_model = self.setup_model(is_teacher=False)
+            
+        # Load model weights
         if student_ckpt_path is not None:
             self._log.info(f"Loading student weights from {student_ckpt_path}")
             student_ckpt = torch.load(student_ckpt_path, map_location=self.device)
@@ -69,22 +76,31 @@ class RFDiffusionDistiller:
         else:
             self._log.info("Initializing student with teacher weights")
             self.student_model.load_state_dict(self.teacher_model.state_dict())
-        
+            
+        if generator_ckpt_path is not None:
+            self._log.info(f"Loading generator weights from {generator_ckpt_path}")
+            generator_ckpt = torch.load(generator_ckpt_path, map_location=self.device)
+            self.generator_model.load_state_dict(generator_ckpt['model_state_dict'], strict=True)
+        else:
+            self._log.info("Initializing generator with student weights")
+            self.generator_model.load_state_dict(self.student_model.state_dict())
+            
         # Set model modes
+        self.teacher_model.eval()  # Teacher is always frozen
         self.student_model.train()
-        self.teacher_model.eval()
+        self.generator_model.train()
         
         # Initialize the all-atom coordinate calculator
         self.allatom = ComputeAllAtomCoords().to(self.device)
         
         self._log.info("Initialized RFDiffusionDistiller successfully")
     
-    def setup_model(self, is_student=False):
+    def setup_model(self, is_teacher=False):
         """
         Setup the model with parameters from the checkpoint
         
         Args:
-            is_student: Whether this is a student model
+            is_teacher: Whether this is the teacher model (which loads weights and is frozen)
             
         Returns:
             The initialized model
@@ -113,21 +129,15 @@ class RFDiffusionDistiller:
             if param in model_config:
                 del model_config[param]
                 
-        # Print the model config for debugging
-        print("Model config parameters after filtering:", model_config.keys())
-        
         # Create model
         model = RoseTTAFoldModule(**model_config, d_t1d=d_t1d, d_t2d=d_t2d, T=T).to(self.device)
         
         # Load weights for teacher model only
-        if not is_student:
+        if is_teacher:
             model.load_state_dict(self.ckpt['model_state_dict'], strict=True)
-        
-        # Set mode
-        if is_student:
-            model.train()
+            model.eval()  # Teacher is always frozen
         else:
-            model.eval()
+            model.train()  # Student/Generator are trainable
             
         return model
         
@@ -149,15 +159,16 @@ class RFDiffusionDistiller:
         self.T = diffuser_config['T']
         self.crd_scale = diffuser_config['crd_scale']
     
-    def save_student_model(self, path):
+    def save_model(self, model, path):
         """
-        Save the student model checkpoint
+        Save a model checkpoint
         
         Args:
+            model: The model to save (teacher, student, or generator)
             path: Path to save the checkpoint
         """
         torch.save({
-            'model_state_dict': self.student_model.state_dict(),
+            'model_state_dict': model.state_dict(),
             'config_dict': self.config_dict
         }, path)
     
@@ -214,45 +225,18 @@ class RFDiffusionDistiller:
         
         return x_t, noise
         
-    def _get_diffusion_step(self, protein_length=150, timestep=10):
+    def compute_score(self, model, x_t, timestep, seq=None):
         """
-        Get a proper diffusion step using the diffuser and score function
+        Compute a model's score function (gradient of log probability) at current state
         
         Args:
-            protein_length: Length of protein
-            timestep: Current timestep
-            
-        Returns:
-            x_t, x_prev, seq
-        """
-            
-        # Create sequence (all masked)
-        seq = torch.full((protein_length,), 21, dtype=torch.long, device=self.device)
-        seq = F.one_hot(seq, num_classes=22).float()  # [L,22]
-        
-        # Create initial noise for x_t
-        # Scale by crd_scale as in the RFDiffusion model
-        x_t = torch.randn(protein_length, 14, 3, device=self.device) * self.crd_scale
-        
-        # Compute score function (gradient of log probability) at timestep t
-        score = self.compute_score(x_t, timestep, seq)
-        
-        # Apply score to get x_{t-1} using the proper posterior sampling rule
-        x_prev = self.apply_score_update(x_t, score, timestep)
-        
-        return x_t, x_prev, seq
-        
-    def compute_teacher_score(self, x_t, timestep, seq=None):
-        """
-        Compute teacher model's score function (gradient of log probability) at current state
-        
-        Args:
+            model: The model to compute the score for (teacher, student, or generator)
             x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
             timestep: Current timestep
             seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
             
         Returns:
-            Teacher model's score function output (gradient)
+            Model's score function output (gradient)
         """
         # Handle batch dimension
         if len(x_t.shape) == 3:
@@ -298,8 +282,8 @@ class RFDiffusionDistiller:
             # Preprocess for model input
             batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask)
             
-            # Get teacher model prediction
-            with torch.no_grad():
+            # Model forward pass
+            with torch.set_grad_enabled(not (model is self.teacher_model)):  # No gradients for teacher
                 msa_masked = batch['msa_masked']
                 msa_full = batch['msa_full']
                 seq_batch = batch['seq']
@@ -310,7 +294,7 @@ class RFDiffusionDistiller:
                 xyz_t_batch = batch['xyz_t']
                 alpha_t = batch['alpha_t']
                 
-                msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.teacher_model(
+                msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = model(
                     msa_masked,
                     msa_full,
                     seq_batch,
@@ -332,11 +316,11 @@ class RFDiffusionDistiller:
                 _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
                 px0_full = px0_full.squeeze()[:, :14]
                 
-                # Calculate score from teacher's predicted x0
+                # Calculate score from model's predicted x0
                 t_idx = timestep - 1  # Convert to 0-indexed
                 beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
                 
-                # Calculate the score estimate (gradient of log probability)
+                # Calculate the score estimate
                 score = (px0_full - x_t[b]) / beta_t
                 all_scores.append(score)
         
@@ -348,10 +332,10 @@ class RFDiffusionDistiller:
             batched_score = batched_score.squeeze(0)
             
         return batched_score
-    
-    def compute_student_score(self, x_t, timestep, seq=None):
+        
+    def compute_teacher_score(self, x_t, timestep, seq=None):
         """
-        Compute student model's score function (gradient of log probability) at current state
+        Compute teacher model's score function (gradient of log probability)
         
         Args:
             x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
@@ -359,116 +343,37 @@ class RFDiffusionDistiller:
             seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
             
         Returns:
-            Student model's score function output (gradient)
+            Teacher's score function output (gradient)
         """
-        # Handle batch dimension
-        if len(x_t.shape) == 3:
-            # Add batch dimension if not present
-            x_t = x_t.unsqueeze(0)
-            single_item = True
-        else:
-            single_item = False
-            
-        # Move to device if needed
-        if x_t.device != self.device:
-            x_t = x_t.to(self.device)
-            
-        B, L = x_t.shape[:2]
+        return self.compute_score(self.teacher_model, x_t, timestep, seq)
         
-        # Process each batch item
-        all_scores = []
-        
-        for b in range(B):
-            # Create or use sequence
-            if seq is None:
-                # Create a masked sequence (all unknown residues)
-                item_seq = torch.full((L,), 21, dtype=torch.long, device=self.device)
-                item_seq = F.one_hot(item_seq, num_classes=22).float()  # [L, 22]
-            else:
-                # Use provided sequence
-                if len(seq.shape) == 2 and seq.shape[0] == L:
-                    # Single sequence for all batch items
-                    item_seq = seq
-                elif len(seq.shape) == 3:
-                    # Batch of sequences
-                    item_seq = seq[b]
-                else:
-                    raise ValueError(f"Invalid sequence shape: {seq.shape}")
-                
-                # Move to device if needed
-                if item_seq.device != self.device:
-                    item_seq = item_seq.to(self.device)
-            
-            # Create diffusion mask (all False to diffuse all residues)
-            diffusion_mask = torch.zeros(L, dtype=torch.bool, device=self.device)
-            
-            # Preprocess for model input
-            batch = self._preprocess(item_seq, x_t[b], timestep, diffusion_mask)
-            
-            # Get student model prediction
-            msa_masked = batch['msa_masked']
-            msa_full = batch['msa_full']
-            seq_batch = batch['seq']
-            xyz_prev = batch['xyz_prev']
-            idx_pdb = batch['idx_pdb']
-            t1d = batch['t1d']
-            t2d = batch['t2d']
-            xyz_t_batch = batch['xyz_t']
-            alpha_t = batch['alpha_t']
-            
-            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.student_model(
-                msa_masked,
-                msa_full,
-                seq_batch,
-                xyz_prev,
-                idx_pdb,
-                t1d=t1d,
-                t2d=t2d,
-                xyz_t=xyz_t_batch,
-                alpha_t=alpha_t,
-                msa_prev=None,
-                pair_prev=None,
-                state_prev=None,
-                t=torch.tensor(timestep, device=self.device),
-                return_infer=True,
-                motif_mask=diffusion_mask
-            )
-            
-            # Process the output to get full atom coordinates
-            _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1), px0, alpha)
-            px0_full = px0_full.squeeze()[:, :14]
-            
-            # Calculate score from student's predicted x0
-            t_idx = timestep - 1  # Convert to 0-indexed
-            beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
-            
-            # Calculate the score estimate
-            score = (px0_full - x_t[b]) / beta_t
-            all_scores.append(score)
-        
-        # Stack all scores
-        batched_score = torch.stack(all_scores)
-        
-        # Remove batch dimension if input was a single item
-        if single_item:
-            batched_score = batched_score.squeeze(0)
-            
-        return batched_score
-        
-    def compute_score(self, x_t, timestep, seq=None):
+    def compute_student_score(self, x_t, timestep, seq=None):
         """
-        Compute score function (gradient of log probability) at current state
-        This is a convenience method that uses the teacher model by default
+        Compute student model's score function (gradient of log probability)
         
         Args:
-            x_t: Coordinates at time t
+            x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
             timestep: Current timestep
-            seq: Optional sequence information. If None, a masked sequence will be created.
+            seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
             
         Returns:
-            Score function output (gradient) from the teacher model
+            Student's score function output (gradient)
         """
-        return self.compute_teacher_score(x_t, timestep, seq)
+        return self.compute_score(self.student_model, x_t, timestep, seq)
+        
+    def compute_generator_score(self, x_t, timestep, seq=None):
+        """
+        Compute generator model's score function (gradient of log probability)
+        
+        Args:
+            x_t: Coordinates at time t [L, 14, 3] or [B, L, 14, 3]
+            timestep: Current timestep
+            seq: Optional one-hot encoded sequence. If None, a masked sequence will be created.
+            
+        Returns:
+            Generator's score function output (gradient)
+        """
+        return self.compute_score(self.generator_model, x_t, timestep, seq)
     
     def apply_score_update(self, x_t, score, timestep):
         """
@@ -518,36 +423,7 @@ class RFDiffusionDistiller:
         x_prev = posterior_mean + posterior_noise
         
         return x_prev
-        
-    def get_single_diffusion_step(self, protein_length=150, timestep=10):
-        """
-        Generate a single step of the diffusion process for training
-        
-        Args:
-            protein_length: Length of the protein
-            timestep: The timestep t to generate
             
-        Returns:
-            Dictionary containing x_t, x_t-1, and other data needed for training
-        """
-        with torch.no_grad():
-            # Create a diffusion mask (all False to diffuse all residues)
-            diffusion_mask = torch.zeros(protein_length, dtype=torch.bool, device=self.device)
-            
-            # Get proper diffusion step with score function
-            x_t, x_t_prev, seq_t = self._get_diffusion_step(protein_length, timestep)
-            
-            # Preprocess for model input
-            batch = self._preprocess(seq_t, x_t, timestep, diffusion_mask)
-            batch.update({
-                'x_t': x_t,
-                'x_t_prev': x_t_prev,
-                'timestep': timestep,
-                'diffusion_mask': diffusion_mask
-            })
-            
-            return batch
-    
     def _preprocess(self, seq, xyz_t, t, diffusion_mask):
         """
         Preprocess inputs for the model
@@ -641,10 +517,23 @@ class RFDiffusionDistiller:
         t2d = torch.zeros((B, T, L, L, 44), device=self.device)
         return t2d
         
+    def compute_score_loss(self, pred_score, target_score):
+        """
+        Compute MSE loss between predicted and target score functions.
+        
+        Args:
+            pred_score: Predicted score
+            target_score: Target score
+            
+        Returns:
+            Loss value
+        """
+        # Use MSE loss for score matching
+        return F.mse_loss(pred_score, target_score)
+    
     def compute_rfdiffusion_loss(self, pred, target, seq=None, w2D=0.5):
         """
         Compute loss the same way RFdiffusion does during training.
-        This function is provided for external use in training pipelines.
         
         Args:
             pred: Predicted coordinates [B, L, 14, 3] or [L, 14, 3]
@@ -959,26 +848,10 @@ class RFDiffusionDistiller:
         
         return angles
         
-    def compute_score_loss(self, pred_score, target_score):
-        """
-        Compute loss between predicted and target score functions.
-        This function is provided for external use in training pipelines.
-        
-        Args:
-            pred_score: Predicted score
-            target_score: Target score
-            
-        Returns:
-            Loss value
-        """
-        # Use MSE loss for score matching
-        return F.mse_loss(pred_score, target_score)
-    
     def calculate_kl_divergence_loss(self, student_score, teacher_score, x_t, timestep):
         """
         Calculate the KL divergence loss between student and teacher score functions.
         This implements the training step for score-based distillation using KL divergence.
-        This function is provided for external use in training pipelines.
         
         Args:
             student_score: Score function from student model
@@ -1005,246 +878,3 @@ class RFDiffusionDistiller:
         ))
         
         return kl_loss
-    
-    def compute_teacher_prediction(self, batch):
-        """
-        Get the teacher model's prediction for a given batch
-        
-        Args:
-            batch: Batch data from get_single_diffusion_step
-            
-        Returns:
-            The teacher's prediction of x0
-        """
-        with torch.no_grad():
-            msa_masked = batch['msa_masked']
-            msa_full = batch['msa_full']
-            seq = batch['seq']
-            xyz_prev = batch['xyz_prev']
-            idx_pdb = batch['idx_pdb']
-            t1d = batch['t1d']
-            t2d = batch['t2d']
-            xyz_t = batch['xyz_t']
-            alpha_t = batch['alpha_t']
-            t = batch['timestep']
-            diffusion_mask = batch['diffusion_mask']
-            
-            msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.teacher_model(
-                msa_masked,
-                msa_full,
-                seq,
-                xyz_prev,
-                idx_pdb,
-                t1d=t1d,
-                t2d=t2d,
-                xyz_t=xyz_t,
-                alpha_t=alpha_t,
-                msa_prev=None,
-                pair_prev=None,
-                state_prev=None,
-                t=torch.tensor(t, device=self.device),
-                return_infer=True,
-                motif_mask=diffusion_mask
-            )
-            
-            # Process the output to get full atom coordinates
-            _, px0_full = self.allatom(torch.argmax(seq, dim=-1), px0, alpha)
-            px0_full = px0_full.squeeze()[:, :14]
-            
-            return px0_full
-    
-    def compute_student_prediction(self, batch):
-        """
-        Get the student model's prediction for a given batch
-        
-        Args:
-            batch: Batch data from get_single_diffusion_step
-            
-        Returns:
-            The student's prediction
-        """
-        msa_masked = batch['msa_masked']
-        msa_full = batch['msa_full']
-        seq = batch['seq']
-        xyz_prev = batch['xyz_prev']
-        idx_pdb = batch['idx_pdb']
-        t1d = batch['t1d']
-        t2d = batch['t2d']
-        xyz_t = batch['xyz_t']
-        alpha_t = batch['alpha_t']
-        t = batch['timestep']
-        diffusion_mask = batch['diffusion_mask']
-        
-        msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.student_model(
-            msa_masked,
-            msa_full,
-            seq,
-            xyz_prev,
-            idx_pdb,
-            t1d=t1d,
-            t2d=t2d,
-            xyz_t=xyz_t,
-            alpha_t=alpha_t,
-            msa_prev=None,
-            pair_prev=None,
-            state_prev=None,
-            t=torch.tensor(t, device=self.device),
-            return_infer=True,
-            motif_mask=diffusion_mask
-        )
-        
-        # Process the output to get full atom coordinates
-        _, px0_full = self.allatom(torch.argmax(seq, dim=-1), px0, alpha)
-        px0_full = px0_full.squeeze()[:, :14]
-        
-        return px0_full
-    
-    def train_step(self, optimizer, protein_length=150, timestep=None, train_on_score=False):
-        """
-        Perform a single training step
-        
-        Args:
-            optimizer: PyTorch optimizer
-            protein_length: Length of the protein
-            timestep: Specific timestep to train on (random if None)
-            train_on_score: If True, train on score matching instead of x0 prediction
-            
-        Returns:
-            Loss value
-        """
-        # Sample a random timestep if not provided
-        if timestep is None:
-            timestep = torch.randint(1, self.T, (1,)).item()
-            
-        # Get a batch of data
-        batch = self.get_single_diffusion_step(protein_length, timestep)
-        
-        # Zero gradients
-        optimizer.zero_grad()
-        
-        if train_on_score:
-            # Get teacher score (gradient of log probability)
-            seq = batch['seq'][0]
-            x_t = batch['x_t']
-            teacher_score = self.compute_teacher_score(seq, x_t, batch['timestep'])
-            
-            # Get student score
-            student_score = self.compute_student_score(seq, x_t, batch['timestep'])
-            
-            # Compute loss - score matching loss
-            # This directly trains the student to match the teacher's score function
-            loss = self.compute_score_loss(student_score, teacher_score)
-        else:
-            # Standard x0 prediction matching
-            # Get teacher prediction of clean x0
-            teacher_pred = self.compute_teacher_prediction(batch)
-            
-            # Get student prediction
-            student_pred = self.compute_student_prediction(batch)
-            
-            # Compute loss - prediction matching loss
-            # MSE loss between teacher and student predictions of x0
-            loss = F.mse_loss(student_pred, teacher_pred)
-        
-        # Backpropagate
-        loss.backward()
-        
-        # Update weights
-        optimizer.step()
-        
-        return loss.item()
-    
-    def train(self, num_steps=1000, lr=1e-4, save_path=None, protein_length=150, train_on_score=False):
-        """
-        Train the student model
-        
-        Args:
-            num_steps: Number of training steps
-            lr: Learning rate
-            save_path: Path to save the final model
-            protein_length: Length of the protein to generate
-            train_on_score: If True, train on score matching instead of x0 prediction
-            
-        Returns:
-            List of loss values
-        """
-        # Create optimizer
-        optimizer = torch.optim.Adam(self.student_model.parameters(), lr=lr)
-        
-        # Training loop
-        losses = []
-        for step in range(num_steps):
-            loss = self.train_step(optimizer, protein_length, train_on_score=train_on_score)
-            losses.append(loss)
-            
-            if step % 10 == 0:
-                print(f"Step {step}, Loss: {loss:.6f}")
-                
-            if save_path is not None and step % 100 == 0:
-                self.save_student_model(f"{save_path}_step_{step}.pt")
-                
-        # Save final model
-        if save_path is not None:
-            self.save_student_model(save_path)
-            
-        return losses
-
-    def encode_trajectory(self, protein_length=150, num_steps=None, include_x0=True):
-        """
-        Generate a full diffusion trajectory for encoding using the score function
-        
-        Args:
-            protein_length: Length of the protein
-            num_steps: Number of diffusion steps (uses T if None)
-            include_x0: Whether to include the ground truth x0
-            
-        Returns:
-            Dictionary with trajectory data
-        """
-        with torch.no_grad():
-            if num_steps is None:
-                num_steps = self.T
-                
-            # Create initial noised state x_T
-            x_T = torch.randn(protein_length, 14, 3, device=self.device) * self.crd_scale
-            
-            # Create sequence (all masked)
-            seq = torch.full((protein_length,), 21, dtype=torch.long, device=self.device)
-            seq = F.one_hot(seq, num_classes=22).float()
-            
-            # Setup trajectory dict
-            trajectory = {
-                'x_t': [x_T],  # Start with x_T
-                'timesteps': list(range(self.T, 0, -1))[:num_steps],  # Count down from T to 1
-                'seq': seq,
-                'diffusion_mask': torch.zeros(protein_length, dtype=torch.bool, device=self.device)
-            }
-            
-            # Starting from x_T, generate states x_{T-1}, x_{T-2}, etc. using score function
-            x_t = x_T
-            for t in range(self.T, max(self.T - num_steps, 0), -1):
-                # Compute score for current state
-                score = self.compute_score(seq, x_t, t)
-                
-                # Apply score to get x_{t-1}
-                x_t = self.apply_score_update(x_t, score, t)
-                
-                # Add to trajectory if within the desired number of steps
-                if t > self.T - num_steps:
-                    trajectory['x_t'].append(x_t)
-            
-            # Reverse the order to go from t=1 to t=T for consistency with timesteps
-            trajectory['x_t'] = trajectory['x_t'][::-1]
-            
-            if include_x0:
-                # For x_0, we use the model's prediction at t=1
-                x_1 = trajectory['x_t'][0]  # First element is now t=1
-                score_1 = self.compute_score(seq, x_1, 1)
-                
-                # The score at t=1 gives us information about x_0
-                noise_level_1 = self.diffuser.get_noise_level(1)
-                x_0 = x_1 + (noise_level_1**2) * score_1
-                
-                trajectory['x_0'] = x_0
-                
-            return trajectory
