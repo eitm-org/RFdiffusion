@@ -48,7 +48,7 @@ class RFDiffusionDistiller:
         # Set default device
         self.default_device = torch.device('cuda:0' if self.cuda_available else 'cpu')
         
-        # Setup device map
+        # Setup device map (but don't use it yet - first initialize all models on same device)
         self.device_map = self._setup_device_map(device_map)
         self._log.info(f"Using device map: {self.device_map}")
         
@@ -56,8 +56,8 @@ class RFDiffusionDistiller:
         ckpt_path = teacher_ckpt_path or "models/Base_ckpt.pt"
         self._log.info(f"Loading checkpoint from {ckpt_path}")
         
-        # Load teacher checkpoint directly
-        self.ckpt = torch.load(ckpt_path, map_location=self.device_map['teacher'])
+        # Load teacher checkpoint to CPU first
+        self.ckpt = torch.load(ckpt_path, map_location='cpu')
         
         # Setup configuration with values from the model checkpoint
         self._log.info("Setting up configuration from checkpoint")
@@ -67,36 +67,46 @@ class RFDiffusionDistiller:
         self._log.info("Setting up diffuser")
         self.setup_diffuser()
         
-        # Create the teacher model
-        self._log.info(f"Creating teacher model on {self.device_map['teacher']}")
-        self.teacher_model = self.setup_model(is_teacher=True, device=self.device_map['teacher'])
+        # First create all models on CPU for faster weight copying
+        self._log.info("Creating models on CPU for initialization")
+        cpu_teacher = self.setup_model(is_teacher=True, device='cpu')
         
-        # Create the student model
-        self._log.info(f"Creating student model on {self.device_map['student']}")
-        self.student_model = self.setup_model(is_teacher=False, device=self.device_map['student'])
+        # Load teacher weights on CPU
+        cpu_teacher.load_state_dict(self.ckpt['model_state_dict'], strict=True)
         
-        # Create the generator model
-        self._log.info(f"Creating generator model on {self.device_map['generator']}")
-        self.generator_model = self.setup_model(is_teacher=False, device=self.device_map['generator'])
-            
-        # Load model weights
+        # Create student model on CPU
         if student_ckpt_path is not None:
             self._log.info(f"Loading student weights from {student_ckpt_path}")
-            student_ckpt = torch.load(student_ckpt_path, map_location=self.device_map['student'])
-            self.student_model.load_state_dict(student_ckpt['model_state_dict'], strict=True)
+            student_ckpt = torch.load(student_ckpt_path, map_location='cpu')
+            cpu_student = self.setup_model(is_teacher=False, device='cpu')
+            cpu_student.load_state_dict(student_ckpt['model_state_dict'], strict=True)
         else:
             self._log.info("Initializing student with teacher weights")
-            # Cross-device state dict copy
-            self._copy_state_dict(self.teacher_model, self.student_model)
-            
+            # Same-device state dict copy (much faster)
+            cpu_student = self.setup_model(is_teacher=False, device='cpu')
+            cpu_student.load_state_dict(cpu_teacher.state_dict())
+        
+        # Create generator model on CPU
         if generator_ckpt_path is not None:
             self._log.info(f"Loading generator weights from {generator_ckpt_path}")
-            generator_ckpt = torch.load(generator_ckpt_path, map_location=self.device_map['generator'])
-            self.generator_model.load_state_dict(generator_ckpt['model_state_dict'], strict=True)
+            generator_ckpt = torch.load(generator_ckpt_path, map_location='cpu')
+            cpu_generator = self.setup_model(is_teacher=False, device='cpu')
+            cpu_generator.load_state_dict(generator_ckpt['model_state_dict'], strict=True)
         else:
             self._log.info("Initializing generator with student weights")
-            # Cross-device state dict copy
-            self._copy_state_dict(self.student_model, self.generator_model)
+            # Same-device state dict copy (much faster)
+            cpu_generator = self.setup_model(is_teacher=False, device='cpu')
+            cpu_generator.load_state_dict(cpu_student.state_dict())
+        
+        # Now move models to their target devices
+        self._log.info(f"Moving teacher model to {self.device_map['teacher']}")
+        self.teacher_model = self._move_model_to_device(cpu_teacher, self.device_map['teacher'])
+        
+        self._log.info(f"Moving student model to {self.device_map['student']}")
+        self.student_model = self._move_model_to_device(cpu_student, self.device_map['student'])
+        
+        self._log.info(f"Moving generator model to {self.device_map['generator']}")
+        self.generator_model = self._move_model_to_device(cpu_generator, self.device_map['generator'])
             
         # Set model modes
         self.teacher_model.eval()  # Teacher is always frozen
@@ -105,6 +115,10 @@ class RFDiffusionDistiller:
         
         # Initialize the all-atom coordinate calculator (on the default device)
         self.allatom = ComputeAllAtomCoords().to(self.default_device)
+        
+        # Clear CPU models to free memory
+        del cpu_teacher, cpu_student, cpu_generator
+        torch.cuda.empty_cache()
         
         self._log.info("Initialized RFDiffusionDistiller successfully")
     
@@ -146,6 +160,29 @@ class RFDiffusionDistiller:
         # Convert string device specifications to torch devices
         return {k: torch.device(v) for k, v in default_map.items()}
     
+    def _move_model_to_device(self, model, device):
+        """
+        Move a model to the specified device
+        
+        Args:
+            model: Model to move
+            device: Target device
+            
+        Returns:
+            Model on the target device
+        """
+        # Convert string device to torch.device if needed
+        if isinstance(device, str):
+            device = torch.device(device)
+            
+        # Move the model
+        model = model.to(device)
+        
+        # Store device in model for easier reference
+        model.device = device
+        
+        return model
+    
     def _copy_state_dict(self, source_model, target_model):
         """
         Copy state dict between models that might be on different devices
@@ -154,6 +191,7 @@ class RFDiffusionDistiller:
             source_model: Source model
             target_model: Target model
         """
+        # This is less efficient than model.load_state_dict() when both models are on the same device
         for name, param in source_model.state_dict().items():
             target_model.state_dict()[name].copy_(param.to(target_model.device))
     
