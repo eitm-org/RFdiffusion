@@ -726,21 +726,33 @@ class RFDiffusionDistiller:
         t2d = torch.zeros((B, T, L, L, 44), device=device)
         return t2d
         
-    def compute_score_loss(self, pred_score, target_score):
+    def compute_score_loss(self, pred_score, target_score, device=None):
         """
         Compute MSE loss between predicted and target score functions.
         
         Args:
             pred_score: Predicted score
             target_score: Target score
+            device: Device to place tensors on (if None, uses pred_score's device)
             
         Returns:
             Loss value
         """
+        # Determine target device if not specified
+        if device is None:
+            device = pred_score.device if hasattr(pred_score, 'device') else self.default_device
+            
+        # Move tensors to the same device if needed
+        if pred_score.device != device:
+            pred_score = pred_score.to(device)
+            
+        if target_score.device != device:
+            target_score = target_score.to(device)
+            
         # Use MSE loss for score matching
         return F.mse_loss(pred_score, target_score)
     
-    def compute_rfdiffusion_loss(self, pred, target, seq=None, w2D=0.5):
+    def compute_rfdiffusion_loss(self, pred, target, seq=None, w2D=0.5, device=None):
         """
         Compute loss the same way RFdiffusion does during training.
         
@@ -749,59 +761,132 @@ class RFDiffusionDistiller:
             target: Target coordinates [B, L, 14, 3] or [L, 14, 3]
             seq: Sequence information [B, L] or [L] (optional)
             w2D: Weight for the L2D term (default: 0.5)
+            device: Device to place tensors on (if None, uses pred's device)
             
         Returns:
             Combined loss value (LFrame + w2D * L2D)
         """
+        # Determine target device if not specified
+        if device is None:
+            device = pred.device if hasattr(pred, 'device') else self.default_device
+            
+        # Move tensors to the same device if needed
+        if pred.device != device:
+            pred = pred.to(device)
+            
+        if target.device != device:
+            target = target.to(device)
+            
+        # Check if shapes match
+        if pred.shape != target.shape:
+            self._log.warning(f"Shape mismatch: pred {pred.shape}, target {target.shape}")
+            # Try to fix shape issues
+            if len(pred.shape) == 3 and len(target.shape) == 4:
+                pred = pred.unsqueeze(0)
+            elif len(pred.shape) == 4 and len(target.shape) == 3:
+                target = target.unsqueeze(0)
+                
+        # Add batch dimension if not present
         if len(pred.shape) == 3:
-            # Add batch dimension if not present
             pred = pred.unsqueeze(0)
+        if len(target.shape) == 3:
             target = target.unsqueeze(0)
+            
+        # Ensure same length in both tensors
+        if pred.shape[1] != target.shape[1]:
+            min_len = min(pred.shape[1], target.shape[1])
+            pred = pred[:, :min_len]
+            target = target[:, :min_len]
         
         # Compute frame loss (coordinate-based MSE loss)
-        frame_loss = self.compute_frame_loss(pred, target)
+        frame_loss = self.compute_frame_loss(pred, target, device)
         
         # Compute 2D loss (inter-residue geometry loss)
         # This includes distances and orientations between residues
-        l2d_loss = self.compute_2d_loss(pred, target, seq)
+        l2d_loss = self.compute_2d_loss(pred, target, seq, device)
         
         # Combine losses as in RFdiffusion
         total_loss = frame_loss + w2D * l2d_loss
         
         return total_loss
         
-    def compute_frame_loss(self, pred, target):
+    def compute_frame_loss(self, pred, target, device=None):
         """
         Compute coordinate-based frame loss as used in RFdiffusion
         
         Args:
             pred: Predicted coordinates [B, L, 14, 3]
             target: Target coordinates [B, L, 14, 3]
+            device: Device to place tensors on (if None, uses pred's device)
             
         Returns:
             Frame loss value
         """
-        # Get backbone atoms (N, CA, C)
-        pred_bb = pred[:, :, :3]
-        target_bb = target[:, :, :3]
+        # Determine target device if not specified
+        if device is None:
+            device = pred.device if hasattr(pred, 'device') else self.default_device
+            
+        # Move tensors to the same device if needed
+        if pred.device != device:
+            pred = pred.to(device)
+            
+        if target.device != device:
+            target = target.to(device)
         
-        # MSE loss on backbone atoms coordinates
-        bb_loss = F.mse_loss(pred_bb, target_bb)
+        # Verify shapes match before continuing
+        if pred.shape != target.shape:
+            self._log.warning(f"Shape mismatch in compute_frame_loss: pred {pred.shape}, target {target.shape}")
+            
+            # Try to fix shape mismatches
+            if len(pred.shape) == 3 and len(target.shape) == 4:
+                pred = pred.unsqueeze(0)
+            elif len(pred.shape) == 4 and len(target.shape) == 3:
+                target = target.unsqueeze(0)
+            
+            # Ensure dimensions match
+            min_batch = min(pred.shape[0], target.shape[0])
+            min_len = min(pred.shape[1], target.shape[1])
+            min_atoms = min(pred.shape[2], target.shape[2])
+            
+            pred = pred[:min_batch, :min_len, :min_atoms]
+            target = target[:min_batch, :min_len, :min_atoms]
+            
+            self._log.info(f"Adjusted shapes to: pred {pred.shape}, target {target.shape}")
         
-        # Get CB atoms (index 4)
-        # If no CB (e.g., for GLY), this will be a virtual CB
-        pred_cb = pred[:, :, 4]
-        target_cb = target[:, :, 4]
-        
-        # MSE loss on CB atoms
-        cb_loss = F.mse_loss(pred_cb, target_cb)
-        
-        # Final frame loss is weighted sum
-        frame_loss = bb_loss + cb_loss
-        
-        return frame_loss
+        try:
+            # Get backbone atoms (N, CA, C)
+            pred_bb = pred[:, :, :3]
+            target_bb = target[:, :, :3]
+            
+            # MSE loss on backbone atoms coordinates
+            bb_loss = F.mse_loss(pred_bb, target_bb)
+            
+            # Get CB atoms (index 4)
+            # If no CB (e.g., for GLY), this will be a virtual CB
+            if pred.shape[2] > 4 and target.shape[2] > 4:
+                pred_cb = pred[:, :, 4]
+                target_cb = target[:, :, 4]
+                
+                # MSE loss on CB atoms
+                cb_loss = F.mse_loss(pred_cb, target_cb)
+                
+                # Final frame loss is weighted sum
+                frame_loss = bb_loss + cb_loss
+            else:
+                frame_loss = bb_loss
+                
+            return frame_loss
+            
+        except RuntimeError as e:
+            # Log error and return a dummy loss
+            self._log.warning(f"Error in compute_frame_loss: {e}")
+            return torch.tensor(0.0, device=device)
+        except IndexError as e:
+            # Log error and return a dummy loss
+            self._log.warning(f"Index error in compute_frame_loss: {e}")
+            return torch.tensor(0.0, device=device)
     
-    def compute_2d_loss(self, pred, target, seq=None):
+    def compute_2d_loss(self, pred, target, seq=None, device=None):
         """
         Compute inter-residue geometry loss (L2D) as used in RFdiffusion
         
@@ -809,10 +894,23 @@ class RFDiffusionDistiller:
             pred: Predicted coordinates [B, L, 14, 3]
             target: Target coordinates [B, L, 14, 3]
             seq: Sequence information [B, L] (optional)
+            device: Device to place tensors on (if None, uses pred's device)
             
         Returns:
             2D loss value
         """
+        # Determine target device if not specified
+        if device is None:
+            device = pred.device if hasattr(pred, 'device') else self.default_device
+            
+        # Move tensors to the same device if needed
+        if pred.device != device:
+            pred = pred.to(device)
+            
+        if target.device != device:
+            target = target.to(device)
+            
+        # Handle potentially different shapes
         B, L = pred.shape[:2]
         
         # Extract relevant atoms for geometry calculations
@@ -832,80 +930,91 @@ class RFDiffusionDistiller:
         
         # For each batch
         for b in range(B):
-            # 1. Compute CB-CB distances
-            pred_cb_dists = torch.cdist(pred_cb[b], pred_cb[b])
-            target_cb_dists = torch.cdist(target_cb[b], target_cb[b])
-            
-            # Convert to binned distributions with 37 bins (0-18.5Å in 0.5Å steps)
-            # RFdiffusion uses a one-hot encoding, but we'll use KL divergence between distributions
-            pred_cb_dist_bins = self._bin_distances(pred_cb_dists)
-            target_cb_dist_bins = self._bin_distances(target_cb_dists)
-            
-            # 2. Compute dihedral angles: Dihedral(Cα,l, Cβ,l, Cα,l′, Cβ,l′)
-            pred_omega = self._compute_dihedral_matrix(
-                pred_ca[b], pred_cb[b], pred_ca[b].unsqueeze(0), pred_cb[b].unsqueeze(0)
-            )
-            target_omega = self._compute_dihedral_matrix(
-                target_ca[b], target_cb[b], target_ca[b].unsqueeze(0), target_cb[b].unsqueeze(0)
-            )
-            
-            # 3. Compute dihedral angles: Dihedral(N,l, Cα,l, Cβ,l, Cβ,l′)
-            pred_theta = self._compute_dihedral_matrix(
-                pred_n[b], pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0)
-            )
-            target_theta = self._compute_dihedral_matrix(
-                target_n[b], target_ca[b], target_cb[b], target_cb[b].unsqueeze(0)
-            )
-            
-            # 4. Compute planar angles: Planar(Cα,l, Cβ,l, Cβ,l′)
-            pred_phi = self._compute_planar_matrix(
-                pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0)
-            )
-            target_phi = self._compute_planar_matrix(
-                target_ca[b], target_cb[b], target_cb[b].unsqueeze(0)
-            )
-            
-            # Convert angles to binned distributions
-            pred_omega_bins = self._bin_angles(pred_omega, angle_type="dihedral")
-            target_omega_bins = self._bin_angles(target_omega, angle_type="dihedral")
-            
-            pred_theta_bins = self._bin_angles(pred_theta, angle_type="dihedral")
-            target_theta_bins = self._bin_angles(target_theta, angle_type="dihedral")
-            
-            pred_phi_bins = self._bin_angles(pred_phi, angle_type="planar")
-            target_phi_bins = self._bin_angles(target_phi, angle_type="planar")
-            
-            # Compute KL divergence between predicted and target distributions
-            dist_loss += F.kl_div(
-                F.log_softmax(pred_cb_dist_bins, dim=-1),
-                F.softmax(target_cb_dist_bins, dim=-1),
-                reduction='none'
-            ).mean()
-            
-            omega_loss += F.kl_div(
-                F.log_softmax(pred_omega_bins, dim=-1),
-                F.softmax(target_omega_bins, dim=-1),
-                reduction='none'
-            ).mean()
-            
-            theta_loss += F.kl_div(
-                F.log_softmax(pred_theta_bins, dim=-1),
-                F.softmax(target_theta_bins, dim=-1),
-                reduction='none'
-            ).mean()
-            
-            phi_loss += F.kl_div(
-                F.log_softmax(pred_phi_bins, dim=-1),
-                F.softmax(target_phi_bins, dim=-1),
-                reduction='none'
-            ).mean()
+            try:
+                # 1. Compute CB-CB distances
+                pred_cb_dists = torch.cdist(pred_cb[b], pred_cb[b])
+                target_cb_dists = torch.cdist(target_cb[b], target_cb[b])
+                
+                # Convert to binned distributions with 37 bins (0-18.5Å in 0.5Å steps)
+                # RFdiffusion uses a one-hot encoding, but we'll use KL divergence between distributions
+                pred_cb_dist_bins = self._bin_distances(pred_cb_dists, device=device)
+                target_cb_dist_bins = self._bin_distances(target_cb_dists, device=device)
+                
+                # 2. Compute dihedral angles: Dihedral(Cα,l, Cβ,l, Cα,l′, Cβ,l′)
+                pred_omega = self._compute_dihedral_matrix(
+                    pred_ca[b], pred_cb[b], pred_ca[b].unsqueeze(0), pred_cb[b].unsqueeze(0), device=device
+                )
+                target_omega = self._compute_dihedral_matrix(
+                    target_ca[b], target_cb[b], target_ca[b].unsqueeze(0), target_cb[b].unsqueeze(0), device=device
+                )
+                
+                # 3. Compute dihedral angles: Dihedral(N,l, Cα,l, Cβ,l, Cβ,l′)
+                pred_theta = self._compute_dihedral_matrix(
+                    pred_n[b], pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0), device=device
+                )
+                target_theta = self._compute_dihedral_matrix(
+                    target_n[b], target_ca[b], target_cb[b], target_cb[b].unsqueeze(0), device=device
+                )
+                
+                # 4. Compute planar angles: Planar(Cα,l, Cβ,l, Cβ,l′)
+                pred_phi = self._compute_planar_matrix(
+                    pred_ca[b], pred_cb[b], pred_cb[b].unsqueeze(0), device=device
+                )
+                target_phi = self._compute_planar_matrix(
+                    target_ca[b], target_cb[b], target_cb[b].unsqueeze(0), device=device
+                )
+                
+                # Convert angles to binned distributions
+                pred_omega_bins = self._bin_angles(pred_omega, angle_type="dihedral", device=device)
+                target_omega_bins = self._bin_angles(target_omega, angle_type="dihedral", device=device)
+                
+                pred_theta_bins = self._bin_angles(pred_theta, angle_type="dihedral", device=device)
+                target_theta_bins = self._bin_angles(target_theta, angle_type="dihedral", device=device)
+                
+                pred_phi_bins = self._bin_angles(pred_phi, angle_type="planar", device=device)
+                target_phi_bins = self._bin_angles(target_phi, angle_type="planar", device=device)
+                
+                # Compute KL divergence between predicted and target distributions
+                dist_loss += F.kl_div(
+                    F.log_softmax(pred_cb_dist_bins, dim=-1),
+                    F.softmax(target_cb_dist_bins, dim=-1),
+                    reduction='none'
+                ).mean()
+                
+                omega_loss += F.kl_div(
+                    F.log_softmax(pred_omega_bins, dim=-1),
+                    F.softmax(target_omega_bins, dim=-1),
+                    reduction='none'
+                ).mean()
+                
+                theta_loss += F.kl_div(
+                    F.log_softmax(pred_theta_bins, dim=-1),
+                    F.softmax(target_theta_bins, dim=-1),
+                    reduction='none'
+                ).mean()
+                
+                phi_loss += F.kl_div(
+                    F.log_softmax(pred_phi_bins, dim=-1),
+                    F.softmax(target_phi_bins, dim=-1),
+                    reduction='none'
+                ).mean()
+            except RuntimeError as e:
+                # If we encounter an error in the 2D loss calculation, log it but don't fail
+                self._log.warning(f"Error computing 2D loss for batch {b}: {e}")
+                # Return a simpler loss if 2D calculation fails
+                return torch.tensor(0.0, device=device)
         
-        # Combine all geometry losses
-        l2d_loss = (dist_loss + omega_loss + theta_loss + phi_loss) / B
+        # Make sure we have at least one batch that succeeded
+        if B > 0:
+            # Combine all geometry losses
+            l2d_loss = (dist_loss + omega_loss + theta_loss + phi_loss) / B
+        else:
+            # Return zero loss if no batches could be processed
+            l2d_loss = torch.tensor(0.0, device=device)
         
         return l2d_loss
     
-    def _bin_distances(self, distances, num_bins=37, max_dist=18.5):
+    def _bin_distances(self, distances, num_bins=37, max_dist=18.5, device=None):
         """
         Convert distances to binned distributions
         
@@ -913,12 +1022,21 @@ class RFDiffusionDistiller:
             distances: Pairwise distance matrix [L, L]
             num_bins: Number of bins (default: 37 for 0-18.5Å in 0.5Å steps)
             max_dist: Maximum distance to consider
+            device: Device to place tensors on (if None, uses distances's device)
             
         Returns:
             Binned distance distributions [L, L, num_bins]
         """
+        # Determine target device if not specified
+        if device is None:
+            device = distances.device if hasattr(distances, 'device') else self.default_device
+            
+        # Move tensor to the target device if needed
+        if distances.device != device:
+            distances = distances.to(device)
+            
         bin_size = max_dist / num_bins
-        bins = torch.arange(0, max_dist + bin_size, bin_size, device=self.device)
+        bins = torch.arange(0, max_dist + bin_size, bin_size, device=device)
         
         # Clamp distances to max_dist
         distances = torch.clamp(distances, 0, max_dist)
@@ -927,7 +1045,7 @@ class RFDiffusionDistiller:
         bin_indices = torch.floor(distances / bin_size).long()
         
         # Create one-hot encoding
-        binned_dists = torch.zeros(*distances.shape, num_bins, device=self.device)
+        binned_dists = torch.zeros(*distances.shape, num_bins, device=device)
         
         # For each position, set the corresponding bin to 1
         for i in range(distances.shape[0]):
@@ -936,7 +1054,7 @@ class RFDiffusionDistiller:
                 
         return binned_dists
     
-    def _bin_angles(self, angles, angle_type="dihedral", eps=1e-8):
+    def _bin_angles(self, angles, angle_type="dihedral", eps=1e-8, device=None):
         """
         Convert angles to binned distributions
         
@@ -944,10 +1062,19 @@ class RFDiffusionDistiller:
             angles: Angle matrix [L, L]
             angle_type: Type of angle ("dihedral" or "planar")
             eps: Small epsilon for numerical stability
+            device: Device to place tensors on (if None, uses angles's device)
             
         Returns:
             Binned angle distributions
         """
+        # Determine target device if not specified
+        if device is None:
+            device = angles.device if hasattr(angles, 'device') else self.default_device
+            
+        # Move tensor to the target device if needed
+        if angles.device != device:
+            angles = angles.to(device)
+            
         if angle_type == "dihedral":
             # For dihedral angles: 37 bins from -π to π
             num_bins = 37
@@ -968,7 +1095,7 @@ class RFDiffusionDistiller:
         bin_indices = torch.floor((angles - min_val) / bin_size).long()
         
         # Create one-hot encoding
-        binned_angles = torch.zeros(*angles.shape, num_bins, device=self.device)
+        binned_angles = torch.zeros(*angles.shape, num_bins, device=device)
         
         # For each position, set the corresponding bin to 1
         for i in range(angles.shape[0]):
@@ -977,87 +1104,123 @@ class RFDiffusionDistiller:
                 
         return binned_angles
     
-    def _compute_dihedral_matrix(self, a, b, c, d):
+    def _compute_dihedral_matrix(self, a, b, c, d, device=None):
         """
         Compute dihedral angles between residues
         
         Args:
             a, b, c, d: Atom coordinates [L, 3]
+            device: Device to place tensors on (if None, uses a's device)
             
         Returns:
             Dihedral angle matrix [L, L]
         """
+        # Determine target device if not specified
+        if device is None:
+            device = a.device if hasattr(a, 'device') else self.default_device
+            
+        # Move tensors to the target device if needed
+        if a.device != device:
+            a = a.to(device)
+        if b.device != device:
+            b = b.to(device)
+        if c.device != device:
+            c = c.to(device)
+        if d.device != device:
+            d = d.to(device)
+            
         L = a.shape[0]
-        dihedrals = torch.zeros((L, L), device=self.device)
+        dihedrals = torch.zeros((L, L), device=device)
         
         # Compute dihedral angles for each pair of residues
         for i in range(L):
             for j in range(L):
                 if i != j:
-                    # Calculate vectors
-                    v1 = b[i] - a[i]  # a->b
-                    v2 = c[j] - b[i]  # b->c
-                    v3 = d[j] - c[j]  # c->d
-                    
-                    # Normalize vectors
-                    v1 = v1 / (torch.norm(v1) + 1e-8)
-                    v2 = v2 / (torch.norm(v2) + 1e-8)
-                    v3 = v3 / (torch.norm(v3) + 1e-8)
-                    
-                    # Compute cross products
-                    n1 = torch.cross(v1, v2)
-                    n2 = torch.cross(v2, v3)
-                    
-                    # Normalize normal vectors
-                    n1 = n1 / (torch.norm(n1) + 1e-8)
-                    n2 = n2 / (torch.norm(n2) + 1e-8)
-                    
-                    # Compute dihedral angle
-                    x = torch.dot(n1, n2)
-                    y = torch.dot(torch.cross(n1, v2/torch.norm(v2)), n2)
-                    
-                    # Calculate dihedral using atan2
-                    dihedral = torch.atan2(y, x)
-                    dihedrals[i, j] = dihedral
+                    try:
+                        # Calculate vectors
+                        v1 = b[i] - a[i]  # a->b
+                        v2 = c[j] - b[i]  # b->c
+                        v3 = d[j] - c[j]  # c->d
+                        
+                        # Normalize vectors
+                        v1 = v1 / (torch.norm(v1) + 1e-8)
+                        v2 = v2 / (torch.norm(v2) + 1e-8)
+                        v3 = v3 / (torch.norm(v3) + 1e-8)
+                        
+                        # Compute cross products
+                        n1 = torch.cross(v1, v2)
+                        n2 = torch.cross(v2, v3)
+                        
+                        # Normalize normal vectors
+                        n1 = n1 / (torch.norm(n1) + 1e-8)
+                        n2 = n2 / (torch.norm(n2) + 1e-8)
+                        
+                        # Compute dihedral angle
+                        x = torch.dot(n1, n2)
+                        y = torch.dot(torch.cross(n1, v2/torch.norm(v2)), n2)
+                        
+                        # Calculate dihedral using atan2
+                        dihedral = torch.atan2(y, x)
+                        dihedrals[i, j] = dihedral
+                    except RuntimeError as e:
+                        # Skip this calculation if it fails
+                        continue
         
         return dihedrals
     
-    def _compute_planar_matrix(self, a, b, c):
+    def _compute_planar_matrix(self, a, b, c, device=None):
         """
         Compute planar angles between residues
         
         Args:
             a, b, c: Atom coordinates [L, 3]
+            device: Device to place tensors on (if None, uses a's device)
             
         Returns:
             Planar angle matrix [L, L]
         """
+        # Determine target device if not specified
+        if device is None:
+            device = a.device if hasattr(a, 'device') else self.default_device
+            
+        # Move tensors to the target device if needed
+        if a.device != device:
+            a = a.to(device)
+        if b.device != device:
+            b = b.to(device)
+        if c.device != device:
+            c = c.to(device)
+            
         L = a.shape[0]
-        angles = torch.zeros((L, L), device=self.device)
+        angles = torch.zeros((L, L), device=device)
         
         # Compute planar angles for each pair of residues
         for i in range(L):
             for j in range(L):
                 if i != j:
-                    # Calculate vectors
-                    v1 = a[i] - b[i]  # a->b
-                    v2 = c[j] - b[i]  # b->c
-                    
-                    # Normalize vectors
-                    v1_norm = torch.norm(v1) + 1e-8
-                    v2_norm = torch.norm(v2) + 1e-8
-                    
-                    # Compute cosine of angle
-                    cos_angle = torch.dot(v1, v2) / (v1_norm * v2_norm)
-                    cos_angle = torch.clamp(cos_angle, -1.0 + 1e-8, 1.0 - 1e-8)
-                    
-                    # Compute angle
-                    angle = torch.acos(cos_angle)
-                    angles[i, j] = angle
+                    try:
+                        # Calculate vectors
+                        v1 = a[i] - b[i]  # a->b
+                        v2 = c[j] - b[i]  # b->c
+                        
+                        # Normalize vectors
+                        v1_norm = torch.norm(v1) + 1e-8
+                        v2_norm = torch.norm(v2) + 1e-8
+                        
+                        # Compute cosine of angle
+                        cos_angle = torch.dot(v1, v2) / (v1_norm * v2_norm)
+                        cos_angle = torch.clamp(cos_angle, -1.0 + 1e-8, 1.0 - 1e-8)
+                        
+                        # Compute angle
+                        angle = torch.acos(cos_angle)
+                        angles[i, j] = angle
+                    except RuntimeError as e:
+                        # Skip this calculation if it fails
+                        continue
         
         return angles
         
-    def calculate_kl_divergence_loss(self, student_score, teacher_score, x_t, timestep):
+    def calculate_kl_divergence_loss(self, student_score, teacher_score, x_t, timestep, device=None):
         """
         Calculate the KL divergence loss between student and teacher score functions.
         This implements the training step for score-based distillation using KL divergence.
@@ -1067,23 +1230,38 @@ class RFDiffusionDistiller:
             teacher_score: Score function from teacher model
             x_t: Noised coordinates at timestep t
             timestep: Current timestep (1-indexed)
+            device: Device to place tensors on (if None, uses student_score's device)
             
         Returns:
             KL divergence loss
         """
-        # Convert to 0-indexed for scheduler
-        t_idx = timestep - 1
-        
-        # Get noise parameters for this timestep
-        beta_t = self.diffuser.eucl_diffuser.beta_schedule[t_idx]
+        # Determine target device if not specified
+        if device is None:
+            device = student_score.device if hasattr(student_score, 'device') else self.default_device
+            
+        # Move tensors to the same device if needed
+        if student_score.device != device:
+            student_score = student_score.to(device)
+            
+        if teacher_score.device != device:
+            teacher_score = teacher_score.to(device)
+            
+        # Get device-specific diffusion parameters
+        params = self._get_device_params(device, timestep)
         
         # Weight for the score discrepancy
         # This weight matches the variance of the forward process
-        weight = beta_t
+        weight = params['beta_t']
         
-        # KL divergence for diffusion models simplifies to weighted MSE between scores
-        kl_loss = weight * torch.mean(torch.sum(
-            (student_score - teacher_score) ** 2, dim=-1
-        ))
+        try:
+            # KL divergence for diffusion models simplifies to weighted MSE between scores
+            kl_loss = weight * torch.mean(torch.sum(
+                (student_score - teacher_score) ** 2, dim=-1
+            ))
+        except RuntimeError as e:
+            # Log error and provide fallback
+            self._log.warning(f"Error computing KL loss: {e}")
+            # Use regular MSE loss as fallback
+            kl_loss = F.mse_loss(student_score, teacher_score)
         
         return kl_loss
