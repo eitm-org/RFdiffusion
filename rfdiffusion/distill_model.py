@@ -1527,3 +1527,194 @@ class RFDiffusionDistiller:
             kl_loss = dummy_tensor * 0.01 + kl_loss.detach()
             
         return kl_loss
+
+    def generate_structure(self, model_type='generator', num_steps=50, protein_length=25, 
+                         batch_size=2, deterministic=True, seq=None, return_trajectory=False):
+        """
+        Generate protein structures using the specified model.
+        
+        Args:
+            model_type: String indicating which model to use ('generator', 'student', or 'teacher')
+            num_steps: Number of denoising steps to perform (default: 50)
+            protein_length: Length of proteins to generate (default: 25)
+            batch_size: Number of structures to generate in parallel (default: 2)
+            deterministic: Whether to use deterministic sampling (default: True)
+            seq: Optional predefined sequence to use
+            return_trajectory: Whether to return the entire denoising trajectory (default: False)
+        
+        Returns:
+            tuple: Depending on return_trajectory:
+                If False: (structures, sequences)
+                If True: (structures, sequences, trajectory)
+                
+            Where:
+               - structures is the final denoised structure [batch_size, protein_length, 14, 3]
+               - sequences is the sequence tensor [batch_size, protein_length]
+               - trajectory is a list of (xt, px0, score) tuples at each step
+        """
+        # Get the model
+        if model_type.lower() == 'generator':
+            model = self.generator_model
+        elif model_type.lower() == 'student':
+            model = self.student_model
+        elif model_type.lower() == 'teacher':
+            model = self.teacher_model
+        else:
+            raise ValueError(f"Invalid model_type: {model_type}. Must be 'generator', 'student', or 'teacher'")
+        
+        # Set model to eval mode for generation
+        training_mode = model.training
+        model.eval()
+        
+        # Get device
+        device = model.device
+        
+        # Create sequence if not provided
+        if seq is None:
+            seq = torch.full((batch_size, protein_length), 21, dtype=torch.long, device=device)
+            seq = F.one_hot(seq, num_classes=22).float()
+        
+        # Get total number of timesteps and create sampling schedule
+        T = self.T
+        timesteps = torch.linspace(T, 1, num_steps, device=device).long()
+        
+        self._log.info(f'Generating {batch_size} structures with {model_type} model using {num_steps} steps...')
+        
+        # Start with random noise
+        x_t = torch.randn(batch_size, protein_length, 14, 3, device=device) * self.crd_scale
+        
+        # For tracking the trajectory if requested
+        trajectory = [] if return_trajectory else None
+        
+        # Sampling loop
+        for i, t in enumerate(timesteps):
+            t_item = t.item()
+            
+            # Take a step with the selected model
+            with torch.no_grad():
+                x_t, px0, score = self.take_step(
+                    model_type,
+                    x_t, 
+                    t_item, 
+                    seq, 
+                    deterministic
+                )
+            
+            # Store trajectory information if requested
+            if return_trajectory:
+                trajectory.append((x_t.clone().cpu(), px0.clone().cpu(), score.clone().cpu()))
+            
+            # Log progress
+            if (i+1) % max(1, num_steps//10) == 0 or i == len(timesteps) - 1:
+                progress = (i+1) / len(timesteps) * 100
+                self._log.info(f"Progress: {progress:.1f}%, Timestep: {t_item}, Max coord: {x_t.abs().max().item():.2f}")
+        
+        # Final denoised structures
+        x_0 = x_t
+        
+        # Center structures on origin (optional but helpful for visualization)
+        x_0 = x_0 - x_0.mean(dim=(1, 2), keepdim=True)
+        
+        # Get sequence indices
+        seq_indices = torch.argmax(seq, dim=2)
+        
+        # Restore model training mode
+        model.train(training_mode)
+        
+        if return_trajectory:
+            return x_0, seq_indices, trajectory
+        else:
+            return x_0, seq_indices
+
+    def take_step(self, model_type, x_t, timestep, seq=None, deterministic=True):
+        """
+        Take a single diffusion step using the specified model.
+        
+        Args:
+            model_type: String indicating which model to use ('generator', 'student', or 'teacher')
+            x_t: Current noisy structure tensor [batch_size, protein_length, 14, 3] or [L, 14, 3]
+            timestep: Current timestep (integer, 1-indexed)
+            seq: One-hot encoded sequence tensor or None to use masked sequence
+            deterministic: Whether to use deterministic sampling (default: True)
+        
+        Returns:
+            tuple: (x_t_1, px0, score) where:
+               - x_t_1 is the next state
+               - px0 is the predicted clean structure
+               - score is the computed score function (useful for training)
+        """
+        # Select the appropriate score function based on model_type
+        if model_type.lower() == 'generator':
+            compute_score_fn = self.compute_generator_score
+        elif model_type.lower() == 'student':
+            compute_score_fn = self.compute_student_score
+        elif model_type.lower() == 'teacher':
+            compute_score_fn = self.compute_teacher_score
+        else:
+            raise ValueError(f"Invalid model_type: {model_type}. Must be 'generator', 'student', or 'teacher'")
+        
+        # Determine device based on input
+        device = x_t.device
+        
+        # Handle batch dimension
+        single_item = False
+        if len(x_t.shape) == 3:
+            x_t = x_t.unsqueeze(0)
+            single_item = True
+        
+        # Create default sequence if not provided
+        if seq is None:
+            batch_size, protein_length = x_t.shape[:2]
+            seq = torch.full((batch_size, protein_length), 21, dtype=torch.long, device=device)
+            seq = F.one_hot(seq, num_classes=22).float()
+        elif len(seq.shape) == 2 and len(x_t.shape) == 4:
+            # Add batch dimension to sequence if needed
+            seq = seq.unsqueeze(0)
+        
+        # Get score prediction
+        score = compute_score_fn(x_t, timestep, seq)
+        
+        # Get diffusion parameters for this device and timestep
+        params = self._get_device_params(device, timestep)
+        beta_t = params['beta_t']
+        
+        # Calculate px0 (predicted clean structure) from score
+        # Since score = (px0 - x_t) / beta_t, we rearrange to get px0
+        px0 = x_t + score * beta_t
+        
+        # If this is the last timestep, just return the prediction
+        if timestep <= 1:
+            result = (px0, px0, score)
+            if single_item:
+                result = (r.squeeze(0) if r is not None else None for r in result)
+            return result
+        
+        # Calculate next timestep for normal step
+        alpha_bar_t = params['alpha_bar_t']
+        
+        # Calculate parameters for the next timestep
+        next_timestep = max(1, timestep - 1)  # Ensure we don't go below 1
+        next_params = self._get_device_params(device, next_timestep)
+        alpha_bar_next = next_params['alpha_bar_t']
+        
+        # Calculate coefficients for the update rule
+        coef1 = torch.sqrt(alpha_bar_next) / torch.sqrt(alpha_bar_t)
+        coef2 = torch.sqrt(1 - alpha_bar_next) - coef1 * torch.sqrt(1 - alpha_bar_t)
+        
+        # Calculate next state
+        if deterministic:
+            # Deterministic update (DDIM-like)
+            x_t_1 = coef1 * px0 + coef2 * (x_t - px0) / torch.sqrt(1 - alpha_bar_t)
+        else:
+            # Stochastic update (DDPM)
+            sigma_t = torch.sqrt(
+                (1 - alpha_bar_next) * beta_t / (1 - alpha_bar_t)
+            )
+            noise = torch.randn_like(x_t)
+            x_t_1 = coef1 * px0 + coef2 * (x_t - px0) / torch.sqrt(1 - alpha_bar_t) + sigma_t * noise
+        
+        # Return results, removing batch dimension if input was single item
+        result = (x_t_1, px0, score)
+        if single_item:
+            result = (r.squeeze(0) if r is not None else None for r in result)
+        return result
