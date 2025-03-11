@@ -418,7 +418,7 @@ class RFDiffusionDistiller:
             'alpha_bar_prev': cache['alphabar_schedule'][t_idx-1] if t_idx > 0 else torch.tensor(1.0, device=device)
         }
     
-    def compute_score(self, model, x_t, timestep, requires_grad=False, seq=None):
+    def compute_score(self, model, x_t, timestep, seq=None,requires_grad=False):
         """
         Compute a model's score function (gradient of log probability) at current state
         
