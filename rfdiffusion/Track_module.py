@@ -96,7 +96,7 @@ class PairStr2Pair(nn.Module):
     def forward(self, pair, rbf_feat):
         B, L = pair.shape[:2]
 
-        rbf_feat = self.proj_rbf(F.relu(self.emb_rbf(rbf_feat)))
+        rbf_feat = self.proj_rbf(F.relu_(self.emb_rbf(rbf_feat)))
 
         pair = pair + self.drop_row(self.row_attn(pair, rbf_feat))
         pair = pair + self.drop_col(self.col_attn(pair, rbf_feat))
@@ -191,10 +191,10 @@ class SCPred(nn.Module):
         state = self.norm_si(state)
         si = self.linear_s0(seq) + self.linear_si(state)
 
-        si = si + self.linear_2(F.relu(self.linear_1(F.relu(si))))
-        si = si + self.linear_4(F.relu(self.linear_3(F.relu(si))))
+        si = si + self.linear_2(F.relu_(self.linear_1(F.relu_(si))))
+        si = si + self.linear_4(F.relu_(self.linear_3(F.relu_(si))))
 
-        si = self.linear_out(F.relu(si))
+        si = self.linear_out(F.relu_(si))
         return si.view(B, L, 10, 2)
 
 
