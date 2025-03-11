@@ -1677,7 +1677,7 @@ class RFDiffusionDistiller:
             # Add batch dimension to sequence if needed
             seq = seq.unsqueeze(0)
         
-            score = compute_score_fn(x_t, seq, timestep)
+        score = compute_score_fn(x_t, seq, timestep)
         
         # Get diffusion parameters for this device and timestep
         params = self._get_device_params(device, timestep)
