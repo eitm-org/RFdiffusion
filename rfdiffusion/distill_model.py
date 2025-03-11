@@ -418,7 +418,7 @@ class RFDiffusionDistiller:
             'alpha_bar_prev': cache['alphabar_schedule'][t_idx-1] if t_idx > 0 else torch.tensor(1.0, device=device)
         }
     
-    def compute_score(self, model, x_t, timestep, seq=None):
+    def compute_score(self, model, x_t, timestep, requires_grad=False, seq=None):
         """
         Compute a model's score function (gradient of log probability) at current state
         
@@ -510,10 +510,16 @@ class RFDiffusionDistiller:
                 )
                 
                 # Process the output to get full atom coordinates
-                with torch.no_grad():  # Always detach here to avoid gradient issues
+                if not requires_grad:
+                    with torch.no_grad():  # Only detach for teacher model
+                        _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1).to(self.default_device), 
+                                                px0.to(self.default_device), 
+                                                alpha.to(self.default_device))
+                        px0_full = px0_full.squeeze()[:, :14].to(model_device)
+                else:
                     _, px0_full = self.allatom(torch.argmax(seq_batch, dim=-1).to(self.default_device), 
-                                              px0.to(self.default_device), 
-                                              alpha.to(self.default_device))
+                                            px0.to(self.default_device), 
+                                            alpha.to(self.default_device))
                     px0_full = px0_full.squeeze()[:, :14].to(model_device)
                 
                 # Get diffusion parameters for this device
@@ -563,7 +569,7 @@ class RFDiffusionDistiller:
         Returns:
             Student's score function output (gradient)
         """
-        return self.compute_score(self.student_model, x_t, timestep, seq)
+        return self.compute_score(self.student_model, x_t, timestep, seq, requires_grad=True)
         
     def compute_generator_score(self, x_t, timestep, seq=None):
         """
@@ -577,7 +583,7 @@ class RFDiffusionDistiller:
         Returns:
             Generator's score function output (gradient)
         """
-        return self.compute_score(self.generator_model, x_t, timestep, seq)
+        return self.compute_score(self.generator_model, x_t, timestep, seq, requires_grad=True)
     
     def apply_score_update(self, x_t, score, timestep, device=None):
         """
@@ -1671,8 +1677,7 @@ class RFDiffusionDistiller:
             # Add batch dimension to sequence if needed
             seq = seq.unsqueeze(0)
         
-        # Get score prediction
-        score = compute_score_fn(x_t, timestep, seq)
+            score = compute_score_fn(x_t, seq, timestep)
         
         # Get diffusion parameters for this device and timestep
         params = self._get_device_params(device, timestep)
