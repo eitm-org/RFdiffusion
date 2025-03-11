@@ -555,7 +555,7 @@ class RFDiffusionDistiller:
         Returns:
             Teacher's score function output (gradient)
         """
-        return self.compute_score(self.teacher_model, x_t, timestep, seq)
+        return self.compute_score(self.teacher_model, x_t, timestep, seq=seq)
         
     def compute_student_score(self, x_t, timestep, seq=None):
         """
@@ -569,7 +569,7 @@ class RFDiffusionDistiller:
         Returns:
             Student's score function output (gradient)
         """
-        return self.compute_score(self.student_model, x_t, timestep, seq, requires_grad=True)
+        return self.compute_score(self.student_model, x_t, timestep, seq=seq, requires_grad=True)
         
     def compute_generator_score(self, x_t, timestep, seq=None):
         """
@@ -583,7 +583,7 @@ class RFDiffusionDistiller:
         Returns:
             Generator's score function output (gradient)
         """
-        return self.compute_score(self.generator_model, x_t, timestep, seq, requires_grad=True)
+        return self.compute_score(self.generator_model, x_t, timestep, seq=seq, requires_grad=True)
     
     def apply_score_update(self, x_t, score, timestep, device=None):
         """
