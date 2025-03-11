@@ -530,7 +530,7 @@ class RFDiffusionDistiller:
                 if model is self.teacher_model:
                     score = ((px0_full - x_t[b]) / params['beta_t']).detach()
                 else:
-                    score = (px0_full - x_t[b]) / params['beta_t']
+                    score = (px0_full - x_t[b].clone()) / params['beta_t']
                     
                 all_scores.append(score)
         
