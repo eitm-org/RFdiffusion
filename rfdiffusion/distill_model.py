@@ -36,14 +36,13 @@ class RFDiffusionDistiller:
                         Example: {'teacher': 'cuda:0', 'student': 'cuda:1', 'generator': 'cuda:1'}
                         If None, all models will be placed on the same device
         """
-
-        if verbose:
-            logging.basicConfig(level=logging.INFO)
-        else:
-            logging.basicConfig(level=logging.ERROR)
-
         # Configure logging
         self._log = logging.getLogger(__name__)
+
+        if verbose:
+            self._log.setLevel(logging.INFO)
+        else:
+            self._log.setLevel(logging.ERROR)
         
         # Get available devices
         self.cuda_available = torch.cuda.is_available()
