@@ -23,7 +23,7 @@ class RFDiffusionDistiller:
     """
     
     def __init__(self, config_path=None, teacher_ckpt_path=None, student_ckpt_path=None, 
-                 generator_ckpt_path=None, device_map=None):
+                 generator_ckpt_path=None, device_map=None, hide_warnings=True):
         """
         Initialize the distiller with teacher, student, and generator models
         
@@ -39,6 +39,9 @@ class RFDiffusionDistiller:
         # Configure logging
         self._log = logging.getLogger(__name__)
         logging.basicConfig(level=logging.INFO)
+
+        if hide_warnings:
+            logging.getLogger().addFilter(lambda record: record.levelno != logging.WARNING)
         
         # Get available devices
         self.cuda_available = torch.cuda.is_available()
