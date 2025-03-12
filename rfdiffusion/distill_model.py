@@ -150,7 +150,7 @@ class RFDiffusionDistiller:
             }
         else:
             # Single GPU or CPU setup
-            device_str = default_device if self.cuda_available else 'cpu'
+            device_str = self.default_device if self.cuda_available else 'cpu'
             default_map = {
                 'teacher': device_str,
                 'student': device_str,
