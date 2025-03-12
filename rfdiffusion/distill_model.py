@@ -23,7 +23,7 @@ class RFDiffusionDistiller:
     """
     
     def __init__(self, config_path=None, teacher_ckpt_path=None, student_ckpt_path=None, 
-                 generator_ckpt_path=None, device_map=None, verbose=True, default_device='cuda:0'):
+                 generator_ckpt_path=None, device_map=None, verbose=True):
         """
         Initialize the distiller with teacher, student, and generator models
         
@@ -50,7 +50,7 @@ class RFDiffusionDistiller:
         self._log.info(f"Found {self.num_gpus} CUDA devices")
         
         # Set default device
-        self.default_device = torch.device(default_device if self.cuda_available else 'cpu')
+        self.default_device = torch.device('cuda:0' if self.cuda_available else 'cpu')
         
         # Setup device map (but don't use it yet - first initialize all models on same device)
         self.device_map = self._setup_device_map(device_map)
@@ -150,7 +150,7 @@ class RFDiffusionDistiller:
             }
         else:
             # Single GPU or CPU setup
-            device_str = self.default_device if self.cuda_available else 'cpu'
+            device_str = 'cuda:0' if self.cuda_available else 'cpu'
             default_map = {
                 'teacher': device_str,
                 'student': device_str,
