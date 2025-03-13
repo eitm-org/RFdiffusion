@@ -1728,541 +1728,65 @@ class RFDiffusionDistiller:
             result = (r.squeeze(0) if r is not None else None for r in result)
         return result
 
-    def calculate_rama_score(self, backbone_coords, device=None, use_ss_context=True):
+    def calculate_structure_score(self, backbone_coords, device=None):
         """
-        Calculate improved Ramachandran plot validation score
-        
-        Args:
-            backbone_coords: Tensor of shape [batch_size, protein_length, 14, 3] 
-                            or [protein_length, 14, 3]
-            device: Device to place tensors on
-            use_ss_context: Whether to use secondary structure context (stricter validation)
-            
-        Returns:
-            rama_scores: Tensor with Ramachandran scores
-        """
-        
-        # Determine device if not provided
-        if device is None:
-            device = backbone_coords.device if hasattr(backbone_coords, 'device') else self.default_device
-        
-        # Add batch dimension if needed
-        if len(backbone_coords.shape) == 3:
-            backbone_coords = backbone_coords.unsqueeze(0)  # Add batch dimension
-        
-        # Extract N, CA, C atoms
-        N = backbone_coords[:, :, 0, :]
-        CA = backbone_coords[:, :, 1, :]
-        C = backbone_coords[:, :, 2, :]
-        
-        batch_size, protein_length = N.shape[0], N.shape[1]
-        
-        # Calculate phi angles: between C(i-1), N(i), CA(i), C(i)
-        # Calculate psi angles: between N(i), CA(i), C(i), N(i+1)
-        
-        # Pre-compute vectors
-        v1 = CA[:, 1:-1, :] - N[:, 1:-1, :]    # CA(i) - N(i)
-        v2 = C[:, 1:-1, :] - CA[:, 1:-1, :]    # C(i) - CA(i)
-        v3 = N[:, 2:, :] - C[:, 1:-1, :]       # N(i+1) - C(i)
-        v4 = C[:, :-2, :] - N[:, 1:-1, :]      # C(i-1) - N(i)
-        
-        # Calculate normal vectors for the dihedral angle planes
-        n1 = torch.cross(v4, v1, dim=2)  # Normal to plane containing C(i-1), N(i), CA(i)
-        n2 = torch.cross(v1, v2, dim=2)  # Normal to plane containing N(i), CA(i), C(i)
-        n3 = torch.cross(v2, v3, dim=2)  # Normal to plane containing CA(i), C(i), N(i+1)
-        
-        # Normalize the normal vectors
-        n1 = n1 / (torch.norm(n1, dim=2, keepdim=True) + 1e-6)
-        n2 = n2 / (torch.norm(n2, dim=2, keepdim=True) + 1e-6)
-        n3 = n3 / (torch.norm(n3, dim=2, keepdim=True) + 1e-6)
-        
-        # Calculate dihedral angles
-        # phi: angle between n1 and n2 planes
-        cos_phi = torch.sum(n1 * n2, dim=2)
-        sin_phi = torch.sum(torch.cross(n1, n2, dim=2) * v2, dim=2) / (torch.norm(v2, dim=2) + 1e-6)
-        phi = torch.atan2(sin_phi, cos_phi)
-        
-        # psi: angle between n2 and n3 planes
-        cos_psi = torch.sum(n2 * n3, dim=2)
-        sin_psi = torch.sum(torch.cross(n2, n3, dim=2) * v3, dim=2) / (torch.norm(v3, dim=2) + 1e-6)
-        psi = torch.atan2(sin_psi, cos_psi)
-        
-        # Convert to degrees for logging
-        phi_deg = phi * 180.0 / torch.pi
-        psi_deg = psi * 180.0 / torch.pi
-        
-        # Define allowed regions using a mixture of Gaussians with carefully tuned parameters
-        # These represent common regions in the Ramachandran plot
-        means = torch.tensor([
-            [-60.0, -40.0],  # Alpha helix
-            [-60.0, 120.0],  # Beta sheet
-            [50.0, 40.0]     # Left-handed helix
-        ], device=device)
-        
-        # Convert means to radians for calculation
-        means = means * torch.pi / 180.0
-        
-        # IMPROVEMENT 1: Tighter covariance matrices for better discrimination against random angles
-        covs = torch.tensor([
-            [0.05, 0.0, 0.0, 0.05],  # Alpha helix - much tighter
-            [0.05, 0.0, 0.0, 0.05],  # Beta sheet - much tighter
-            [0.02, 0.0, 0.0, 0.02]   # Left-handed helix - much tighter
-        ], device=device).view(3, 2, 2)
-        
-        # IMPROVEMENT 2: More punitive weights for regions that occur rarely in proteins
-        weights = torch.tensor([0.7, 0.25, 0.05], device=device)
-        
-        # Calculate Ramachandran score using log-likelihood for better numerical properties
-        phi_psi = torch.stack([phi, psi], dim=2)
-        
-        # Initialize with very low log scores
-        log_scores = torch.ones(batch_size, protein_length-2, device=device) * -100.0
-        
-        # Store mahalanobis distances for each component
-        all_mahalanobis = []
-        
-        # Calculate log-likelihood for each component
-        for i in range(means.shape[0]):
-            diff = phi_psi - means[i]
-            # Normalize angles to handle periodicity (-π to π radians)
-            diff = torch.remainder(diff + torch.pi, 2 * torch.pi) - torch.pi
-            
-            cov_inv = torch.inverse(covs[i])
-            mahalanobis = torch.sum(torch.matmul(diff.unsqueeze(2), cov_inv).squeeze(2) * diff, dim=2)
-            all_mahalanobis.append(mahalanobis)
-            log_component_score = torch.log(weights[i]) - 0.5 * mahalanobis
-            log_scores = torch.logaddexp(log_scores, log_component_score)
-        
-        # IMPROVEMENT 3: Much stronger penalty for regions far from any allowed region
-        min_mahalanobis, _ = torch.min(torch.stack(all_mahalanobis), dim=0)
-        outlier_penalty = torch.exp(-0.01 * min_mahalanobis)  # More gradual falloff
-        log_scores = log_scores - outlier_penalty  # Stronger penalty weight
-        
-        # IMPROVEMENT 4: Secondary structure context (optional)
-        if use_ss_context:
-            # Detect likely secondary structure from existing angles
-            # Simple heuristic: consecutive residues with similar angles are likely in organized structure
-            # If angles change rapidly, likely in random configuration
-            
-            # Calculate angle differences between consecutive residues
-            # This detects rapid changes in angles that are unnatural
-            phi_diff = torch.abs(phi[:, 1:] - phi[:, :-1])
-            psi_diff = torch.abs(psi[:, 1:] - psi[:, :-1])
-            
-            # Normalize diffs to handle periodicity
-            phi_diff = torch.min(phi_diff, 2*torch.pi - phi_diff)
-            psi_diff = torch.min(psi_diff, 2*torch.pi - psi_diff)
-            
-            # Large differences indicate inconsistent secondary structure
-            # Small differences indicate organized structure (helix or sheet)
-            ss_consistency = torch.exp(-(phi_diff + psi_diff))
-            
-            # Pad to match dimensions
-            ss_consistency = torch.cat([
-                ss_consistency,
-                torch.ones(batch_size, 1, device=device)
-            ], dim=1)
-            
-            # Apply secondary structure consistency as a multiplier
-            # This punishes regions that should be in consistent secondary structure
-            # but have random-like angle patterns
-            log_scores = log_scores * (0.5 + 0.5 * ss_consistency)
-        
-        # Debug info
-        if torch.cuda.is_available() and torch.cuda.current_device() == 0:
-            try:
-                if torch.distributed.get_rank() == 0:
-                    with torch.no_grad():
-                        self._log.info(f"Rama scores: min={log_scores.min().item():.4f}, max={log_scores.max().item():.4f}, mean={log_scores.mean().item():.4f}")
-                        self._log.info(f"Phi range: {phi_deg.min().item():.1f} to {phi_deg.max().item():.1f}")
-                        self._log.info(f"Psi range: {psi_deg.min().item():.1f} to {psi_deg.max().item():.1f}")
-            except:
-                # If distributed not initialized or other error, just print from main process
-                with torch.no_grad():
-                    self._log.info(f"Rama scores: min={log_scores.min().item():.4f}, max={log_scores.max().item():.4f}, mean={log_scores.mean().item():.4f}")
-                    self._log.info(f"Phi range: {phi_deg.min().item():.1f} to {phi_deg.max().item():.1f}")
-                    self._log.info(f"Psi range: {psi_deg.min().item():.1f} to {psi_deg.max().item():.1f}")
-    
-        return log_scores
-
-    def calculate_bond_geometry(self, backbone_coords, device=None):
-        """
-        Calculate bond geometry validation score (bond lengths and angles)
+        Calculate structure quality score based on local fragment RMSD
         
         Args:
             backbone_coords: Tensor of shape [batch_size, protein_length, 14, 3]
-            device: Device for computation
+            device: Computation device
             
         Returns:
-            Bond geometry score [batch_size]
+            Structure score (higher = better)
         """
-        
-        # Determine device if not provided
-        if device is None:
-            device = backbone_coords.device if hasattr(backbone_coords, 'device') else self.default_device
+
         
         # Add batch dimension if needed
         if len(backbone_coords.shape) == 3:
-            backbone_coords = backbone_coords.unsqueeze(0)  # Add batch dimension
+            backbone_coords = backbone_coords.unsqueeze(0)
+        
+        batch_size, protein_length = backbone_coords.shape[:2]
         
         # Extract backbone atoms
         N = backbone_coords[:, :, 0, :]
         CA = backbone_coords[:, :, 1, :]
         C = backbone_coords[:, :, 2, :]
         
-        batch_size, protein_length = N.shape[0], N.shape[1]
+        # Calculate fragment size
+        fragment_size = 5
         
-        # Calculate bond lengths
-        n_ca_bond = torch.norm(N - CA, dim=2)  # N-CA bonds
-        ca_c_bond = torch.norm(CA - C, dim=2)  # CA-C bonds
-        c_n_bond = torch.norm(C[:, :-1] - N[:, 1:], dim=2)  # C-N bonds
+        # Initialize fragment scores
+        fragment_scores = []
         
-        # Ideal bond lengths
-        ideal_n_ca = 1.45  # Å
-        ideal_ca_c = 1.52  # Å
-        ideal_c_n = 1.33   # Å
-        
-        # Calculate bond length deviations
-        n_ca_dev = torch.abs(n_ca_bond - ideal_n_ca)
-        ca_c_dev = torch.abs(ca_c_bond - ideal_ca_c)
-        c_n_dev = torch.abs(c_n_bond - ideal_c_n)
-        
-        # Exponential penalty for bond length deviations
-        n_ca_penalty = torch.exp(5.0 * n_ca_dev) - 1.0
-        ca_c_penalty = torch.exp(5.0 * ca_c_dev) - 1.0
-        c_n_penalty = torch.exp(5.0 * c_n_dev) - 1.0
-        
-        # Calculate bond angles
-        # Vectors for CA-centered angle
-        ca_n_vec = N - CA
-        ca_c_vec = C - CA
-        
-        # Normalize vectors
-        ca_n_vec_norm = ca_n_vec / (torch.norm(ca_n_vec, dim=2, keepdim=True) + 1e-6)
-        ca_c_vec_norm = ca_c_vec / (torch.norm(ca_c_vec, dim=2, keepdim=True) + 1e-6)
-        
-        # Calculate cosine of CA-centered angle
-        cos_ca_angle = torch.sum(ca_n_vec_norm * ca_c_vec_norm, dim=2)
-        cos_ca_angle = torch.clamp(cos_ca_angle, -1.0 + 1e-6, 1.0 - 1e-6)
-        ca_angle = torch.acos(cos_ca_angle)
-        
-        # Ideal CA-centered angle (in radians)
-        ideal_ca_angle = 111.0 * torch.pi / 180.0
-        
-        # Calculate bond angle deviations
-        ca_angle_dev = torch.abs(ca_angle - ideal_ca_angle)
-        
-        # Exponential penalty for bond angle deviations
-        ca_angle_penalty = torch.exp(2.0 * ca_angle_dev) - 1.0
-        
-        # Combine all penalties
-        total_penalty = (
-            n_ca_penalty.mean(dim=1) + 
-            ca_c_penalty.mean(dim=1) + 
-            c_n_penalty.mean(dim=1) + 
-            ca_angle_penalty.mean(dim=1)
-        )
-        
-        # Convert to score (higher is better)
-        bond_score = -total_penalty
-        
-        # Debug info
-        if torch.cuda.is_available() and torch.cuda.current_device() == 0:
-            try:
-                if torch.distributed.get_rank() == 0:
-                    with torch.no_grad():
-                        self._log.info(f"Bond geometry score: {bond_score.mean().item():.4f}")
-                        self._log.info(f"N-CA bonds: mean={n_ca_bond.mean().item():.2f}Å (ideal: {ideal_n_ca}Å)")
-                        self._log.info(f"CA-C bonds: mean={ca_c_bond.mean().item():.2f}Å (ideal: {ideal_ca_c}Å)")
-                        self._log.info(f"CA angle: mean={ca_angle.mean().item() * 180.0 / torch.pi:.1f}° (ideal: 111.0°)")
-            except:
-                with torch.no_grad():
-                    self._log.info(f"Bond geometry score: {bond_score.mean().item():.4f}")
-                    self._log.info(f"N-CA bonds: mean={n_ca_bond.mean().item():.2f}Å (ideal: {ideal_n_ca}Å)")
-                    self._log.info(f"CA-C bonds: mean={ca_c_bond.mean().item():.2f}Å (ideal: {ideal_ca_c}Å)")
-                    self._log.info(f"CA angle: mean={ca_angle.mean().item() * 180.0 / torch.pi:.1f}° (ideal: 111.0°)")
-        
-        return bond_score
-
-    def create_range_mask(self, length, min_sep, max_sep, device=None):
-        """
-        Create a mask for sequence separations within a specific range
-        
-        Args:
-            length: Length of protein
-            min_sep: Minimum sequence separation
-            max_sep: Maximum sequence separation
-            device: Device to place tensor on
-        
-        Returns:
-            Mask tensor of shape [length, length]
-        """
-        
-        if device is None:
-            device = self.default_device
-        
-        mask = torch.zeros(length, length, device=device)
-        for i in range(length):
-            for j in range(length):
-                sep = abs(i - j)
-                if min_sep <= sep <= max_sep:
-                    mask[i, j] = 1.0
-        return mask
-
-    def distance_violation_score(self, distances, mask, min_dist, max_dist, tight_min=None, tight_max=None):
-        """
-        Calculate distance violation score
-        
-        Args:
-            distances: Pairwise distance matrix [L, L]
-            mask: Mask indicating which pairs to consider [L, L]
-            min_dist: Minimum allowed distance
-            max_dist: Maximum allowed distance
-            tight_min: Optimal minimum (if None, uses min_dist)
-            tight_max: Optimal maximum (if None, uses max_dist)
+        # Process each fragment
+        for i in range(protein_length - fragment_size + 1):
+            # Extract fragment backbone coordinates
+            frag_ca = CA[:, i:i+fragment_size, :]  # [B, 5, 3]
             
-        Returns:
-            Violation score (lower is better)
-        """
-
-        if tight_min is None:
-            tight_min = min_dist
-        if tight_max is None:
-            tight_max = max_dist
-        
-        # No penalty in the "tight" range
-        penalty = torch.zeros_like(distances)
-        
-        # Penalty for distances below minimum
-        below_min = (distances < min_dist) & (mask > 0)
-        penalty[below_min] = torch.abs(distances[below_min] - min_dist) * 2.0
-        
-        # Smaller penalty for distances below tight_min but above min
-        below_tight = (distances >= min_dist) & (distances < tight_min) & (mask > 0)
-        penalty[below_tight] = torch.abs(distances[below_tight] - tight_min) * 0.5
-        
-        # Smaller penalty for distances above tight_max but below max
-        above_tight = (distances > tight_max) & (distances <= max_dist) & (mask > 0)
-        penalty[above_tight] = torch.abs(distances[above_tight] - tight_max) * 0.5
-        
-        # Penalty for distances above maximum
-        above_max = (distances > max_dist) & (mask > 0)
-        penalty[above_max] = torch.abs(distances[above_max] - max_dist) * 2.0
-        
-        # Sum all penalties and normalize by the number of pairs
-        total_pairs = torch.sum(mask)
-        if total_pairs > 0:
-            return torch.sum(penalty * mask) / total_pairs
-        else:
-            return torch.tensor(0.0, device=distances.device)
-
-    def calculate_cb_distances(self, backbone_coords, device=None):
-        """
-        Calculate CB-CB distances between residues using the RFdiffusion approach
-        
-        Args:
-            backbone_coords: Tensor of shape [batch_size, protein_length, 14, 3]
-            device: Computation device
+            # Calculate pairwise distances within fragment
+            distances = []
+            for j in range(fragment_size):
+                for k in range(j+1, fragment_size):
+                    # Distance between CA atoms in fragment
+                    dist = torch.norm(frag_ca[:, j, :] - frag_ca[:, k, :], dim=-1)  # [B]
+                    distances.append(dist)
             
-        Returns:
-            distance_score: Tensor of shape [batch_size]
-        """
-        
-        # Determine device if not provided
-        if device is None:
-            device = backbone_coords.device if hasattr(backbone_coords, 'device') else self.default_device
-        
-        # Add batch dimension if needed
-        if len(backbone_coords.shape) == 3:
-            backbone_coords = backbone_coords.unsqueeze(0)  # Add batch dimension
-        
-        batch_size, L = backbone_coords.shape[:2]
-        
-        # Extract CB atoms (index 4) or use CA atoms (index 1) if CB not available
-        if backbone_coords.shape[2] > 4:
-            CB = backbone_coords[:, :, 4, :]
-        else:
-            # Use CA as fallback
-            CB = backbone_coords[:, :, 1, :]
-        
-        # Initialize distance score
-        distance_scores = torch.zeros(batch_size, device=device)
-        
-        # Process each batch
-        for b in range(batch_size):
-            try:
-                # Calculate pairwise CB-CB distances
-                cb_dists = torch.cdist(CB[b], CB[b])
-                
-                # Create masks for different sequence separations
-                local_mask = self.create_range_mask(L, 2, 5, device)  # Local interactions (2-5 residues apart)
-                medium_mask = self.create_range_mask(L, 6, 11, device)  # Medium-range (6-11 residues apart)
-                long_mask = self.create_range_mask(L, 12, L, device)  # Long-range (12+ residues apart)
-                
-                # IMPROVEMENT: Stricter distance constraints for better discrimination against random structures
-                local_penalty = self.distance_violation_score(cb_dists, local_mask, 
-                                                        min_dist=3.8, max_dist=7.5, 
-                                                        tight_min=5.0, tight_max=6.8)
-                
-                medium_penalty = self.distance_violation_score(cb_dists, medium_mask, 
-                                                        min_dist=5.0, max_dist=13.0, 
-                                                        tight_min=6.0, tight_max=11.0)
-                
-                long_penalty = self.distance_violation_score(cb_dists, long_mask, 
-                                                    min_dist=5.0, max_dist=25.0, 
-                                                    tight_min=None, tight_max=None)
-                
-                # Combine penalties with appropriate weights
-                # IMPROVEMENT: Higher weight on long-range contacts which are critical for tertiary structure
-                combined_penalty = (
-                    0.3 * local_penalty + 
-                    0.3 * medium_penalty + 
-                    0.4 * long_penalty  # Increased weight for long-range interactions
-                )
-                
-                # Store the result for this batch
-                distance_scores[b] = -combined_penalty  # Negative because lower penalty = better score
-                
-                # Log for debugging
-                if torch.cuda.is_available() and torch.cuda.current_device() == 0:
-                    try:
-                        if torch.distributed.get_rank() == 0:
-                            with torch.no_grad():
-                                self._log.info(f"Batch {b} - Distance penalties: local={local_penalty.item():.4f}, medium={medium_penalty.item():.4f}, long={long_penalty.item():.4f}")
-                    except:
-                        with torch.no_grad():
-                            self._log.info(f"Batch {b} - Distance penalties: local={local_penalty.item():.4f}, medium={medium_penalty.item():.4f}, long={long_penalty.item():.4f}")
+            # Stack all pairwise distances
+            frag_distances = torch.stack(distances, dim=1)  # [B, num_pairs]
             
-            except Exception as e:
-                self._log.warning(f"Error in CB distance calculation for batch {b}: {e}")
-                distance_scores[b] = torch.tensor(-10.0, device=device)  # Assign poor score on error
-        
-        return distance_scores
-
-    def apply_softmin(self, scores, temperature=0.1):
-        """
-        Apply softmin to scores to focus on worst regions
-        
-        Args:
-            scores: Tensor of any shape
-            temperature: Temperature parameter for softmin (LOWER = more focus on worst)
-        
-        Returns:
-            softmin: Scalar loss value
-        """
-        
-        # Flatten all dimensions
-        scores_flat = scores.reshape(-1)
-        
-        # Apply softmin on the flattened tensor
-        # IMPROVEMENT: Lower temperature (0.1 vs 0.2) for more focus on worst regions
-        softmin = -temperature * torch.logsumexp(-scores_flat / temperature, dim=0)
-        
-        return softmin
-
-    def combined_structure_score(self, backbone_coords, device=None, weights=None):
-        """
-        Combined structure evaluation incorporating Ramachandran, bond geometry,
-        and inter-residue distance validation
-        
-        Args:
-            backbone_coords: Tensor of shape [batch_size, protein_length, 14, 3]
-            device: Computation device
-            weights: Dictionary of weights for different components
+            # Evaluate fragment quality based on distance distribution
+            # In ideal secondary structures, these distances follow specific patterns
+            variance = torch.var(frag_distances, dim=1)  # [B]
             
-        Returns:
-            Combined score, individual component scores
-        """
+            # Higher variance = more disordered (lower score)
+            fragment_score = torch.exp(-5.0 * variance)
+            fragment_scores.append(fragment_score)
         
-        # Default weights with IMPROVEMENT: More balanced weights
-        if weights is None:
-            weights = {
-                'rama': 1.0,
-                'bond': 1.0,
-                'cb_dist': 1.0
-            }
+        # Stack fragment scores
+        fragment_scores = torch.stack(fragment_scores, dim=1)  # [B, num_fragments]
         
-        # Determine device if not provided
-        if device is None:
-            device = backbone_coords.device if hasattr(backbone_coords, 'device') else self.default_device
-            
-        # Add batch dimension if needed
-        if len(backbone_coords.shape) == 3:
-            backbone_coords = backbone_coords.unsqueeze(0)  # Add batch dimension
+        # Compute global score using softmin to focus on worst fragments
+        temperature = 0.1
+        structure_score = -temperature * torch.logsumexp(-fragment_scores / temperature, dim=1)
         
-        # Calculate Ramachandran scores
-        rama_scores = self.calculate_rama_score(backbone_coords, device)
-        
-        # Apply softmin with lower temperature to focus on worst regions
-        rama_softmin = self.apply_softmin(rama_scores, temperature=0.1)
-        
-        # Calculate bond geometry scores
-        bond_scores = self.calculate_bond_geometry(backbone_coords, device)
-        
-        # Calculate CB distance scores
-        cb_dist_scores = self.calculate_cb_distances(backbone_coords, device)
-        
-        # Combine scores
-        combined_score = (
-            weights['rama'] * rama_softmin + 
-            weights['bond'] * bond_scores.mean() + 
-            weights['cb_dist'] * cb_dist_scores.mean()
-        )
-        
-        # Return individual components for analysis
-        components = {
-            'rama': rama_softmin,
-            'bond': bond_scores.mean(),
-            'cb_dist': cb_dist_scores.mean()
-        }
-        
-        return combined_score, components
-
-    def compute_structure_loss(self, pred, w_rama=1.0, w_bond=1.0, w_cb=1.0, device=None):
-        """
-        Compute comprehensive structure validation loss for predicted coordinates
-        
-        Args:
-            pred: Predicted coordinates [B, L, 14, 3] or [L, 14, 3]
-            w_rama: Weight for Ramachandran component
-            w_bond: Weight for bond geometry component
-            w_cb: Weight for CB distance component
-            device: Computation device
-            
-        Returns:
-            Combined structure validation loss
-        """
-        
-        # Determine device if not provided
-        if device is None:
-            device = pred.device if hasattr(pred, 'device') else self.default_device
-        
-        # Add batch dimension if needed
-        if len(pred.shape) == 3:
-            pred = pred.unsqueeze(0)  # Add batch dimension
-        
-        # Configure weights
-        weights = {
-            'rama': w_rama,
-            'bond': w_bond,
-            'cb_dist': w_cb
-        }
-        
-        # Calculate combined structure score
-        structure_score, components = self.combined_structure_score(
-            pred, device, weights=weights
-        )
-        
-        # Negative because higher scores = better structure
-        structure_loss = -structure_score
-        
-        # Log components
-        self._log.info(
-            f"Structure validation: "
-            f"Rama={components['rama'].item():.4f}, "
-            f"Bond={components['bond'].item():.4f}, "
-            f"CB={components['cb_dist'].item():.4f}, "
-            f"Loss={structure_loss.item():.4f}"
-        )
-        
-        return structure_loss
+        return structure_score
