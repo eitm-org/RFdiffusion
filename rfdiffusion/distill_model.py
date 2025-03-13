@@ -1896,7 +1896,6 @@ class RFDiffusionDistiller:
         Returns:
             Bond geometry score [batch_size]
         """
-        import torch
         
         # Determine device if not provided
         if device is None:
@@ -1998,7 +1997,6 @@ class RFDiffusionDistiller:
         Returns:
             Mask tensor of shape [length, length]
         """
-        import torch
         
         if device is None:
             device = self.default_device
@@ -2026,8 +2024,7 @@ class RFDiffusionDistiller:
         Returns:
             Violation score (lower is better)
         """
-        import torch
-        
+
         if tight_min is None:
             tight_min = min_dist
         if tight_max is None:
@@ -2070,7 +2067,6 @@ class RFDiffusionDistiller:
         Returns:
             distance_score: Tensor of shape [batch_size]
         """
-        import torch
         
         # Determine device if not provided
         if device is None:
@@ -2154,7 +2150,6 @@ class RFDiffusionDistiller:
         Returns:
             softmin: Scalar loss value
         """
-        import torch
         
         # Flatten all dimensions
         scores_flat = scores.reshape(-1)
@@ -2178,7 +2173,6 @@ class RFDiffusionDistiller:
         Returns:
             Combined score, individual component scores
         """
-        import torch
         
         # Default weights with IMPROVEMENT: More balanced weights
         if weights is None:
@@ -2238,7 +2232,6 @@ class RFDiffusionDistiller:
         Returns:
             Combined structure validation loss
         """
-        import torch
         
         # Determine device if not provided
         if device is None:
