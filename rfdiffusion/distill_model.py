@@ -1728,65 +1728,729 @@ class RFDiffusionDistiller:
             result = (r.squeeze(0) if r is not None else None for r in result)
         return result
 
-    def calculate_structure_score(self, backbone_coords, device=None):
+    def compute_structural_realism_loss(self, coords, device=None):
         """
-        Calculate structure quality score based on local fragment RMSD
+        Compute a structural realism loss that evaluates the physical plausibility
+        of protein backbone coordinates without requiring sequence or reference structure.
         
         Args:
-            backbone_coords: Tensor of shape [batch_size, protein_length, 14, 3]
-            device: Computation device
+            coords: Protein backbone coordinates [B, L, 14, 3] or [L, 14, 3]
+            device: Device to place tensors on (if None, uses coords's device)
             
         Returns:
-            Structure score (higher = better)
+            Total realism loss
         """
+        # Determine target device if not specified
+        if device is None:
+            device = coords.device if hasattr(coords, 'device') else self.default_device
+            
+        # Move tensor to the target device if needed
+        if coords.device != device:
+            coords = coords.to(device)
+            
+        # Handle batch dimension
+        if len(coords.shape) == 3:
+            coords = coords.unsqueeze(0)
+            single_item = True
+        else:
+            single_item = False
+            
+        batch_size, protein_length = coords.shape[:2]
+        
+        # Initialize loss components
+        total_loss = torch.tensor(0.0, device=device)
+        
+        # Process each batch item
+        batch_loss = 0.0
+        for b in range(batch_size):
+            try:
+                # Extract backbone atoms (N, CA, C, O)
+                bb_coords = coords[b, :, :4]  # [L, 4, 3]
+                
+                # 1. Bond length validation
+                bond_length_loss = self._compute_bond_length_loss(bb_coords, device)
+                
+                # 2. Bond angle validation
+                bond_angle_loss = self._compute_bond_angle_loss(bb_coords, device)
+                
+                # 3. Ramachandran validation
+                rama_loss = self._compute_ramachandran_loss(bb_coords, device)
+                
+                # 4. Non-bonded interactions (clashes and contacts)
+                nonbonded_loss = self._compute_nonbonded_loss(bb_coords, device)
+                
+                # 5. CA-CA distance profile validation
+                ca_dist_loss = self._compute_ca_distance_loss(bb_coords, device)
+                
+                # 6. Backbone planarity and omega angles
+                backbone_reg_loss = self._compute_backbone_regularity_loss(bb_coords, device)
+                
+                # Combine all loss components with appropriate weights
+                item_loss = (
+                    0.5 * bond_length_loss +    # Strong penalty for incorrect bond lengths
+                    0.5 * bond_angle_loss +     # Strong penalty for incorrect bond angles
+                    0.3 * rama_loss +           # Moderate penalty for unlikely torsion angles
+                    0.3 * nonbonded_loss +      # Moderate penalty for clashes
+                    0.3 * ca_dist_loss +        # Moderate penalty for unusual CA-CA distances
+                    0.4 * backbone_reg_loss     # Important for peptide bond geometry
+                )
+                
+                # Accumulate batch loss
+                batch_loss += item_loss
+                        
+            except Exception as e:
+                self._log.warning(f"Error computing structural realism loss for batch item {b}: {e}")
+                # Add a default loss to ensure gradients
+                batch_loss += torch.tensor(1.0, device=device, requires_grad=True)
+        
+        # Average losses over batch
+        total_loss = batch_loss / batch_size
+        
+        # Return single tensor for single input
+        if single_item:
+            return total_loss
+        else:
+            return total_loss
 
+    def _compute_bond_length_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on deviation of bond lengths from ideal values.
         
-        # Add batch dimension if needed
-        if len(backbone_coords.shape) == 3:
-            backbone_coords = backbone_coords.unsqueeze(0)
-        
-        batch_size, protein_length = backbone_coords.shape[:2]
-        
-        # Extract backbone atoms
-        N = backbone_coords[:, :, 0, :]
-        CA = backbone_coords[:, :, 1, :]
-        C = backbone_coords[:, :, 2, :]
-        
-        # Calculate fragment size
-        fragment_size = 5
-        
-        # Initialize fragment scores
-        fragment_scores = []
-        
-        # Process each fragment
-        for i in range(protein_length - fragment_size + 1):
-            # Extract fragment backbone coordinates
-            frag_ca = CA[:, i:i+fragment_size, :]  # [B, 5, 3]
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
             
-            # Calculate pairwise distances within fragment
-            distances = []
-            for j in range(fragment_size):
-                for k in range(j+1, fragment_size):
-                    # Distance between CA atoms in fragment
-                    dist = torch.norm(frag_ca[:, j, :] - frag_ca[:, k, :], dim=-1)  # [B]
-                    distances.append(dist)
+        Returns:
+            Bond length loss
+        """
+        if device is None:
+            device = bb_coords.device
             
-            # Stack all pairwise distances
-            frag_distances = torch.stack(distances, dim=1)  # [B, num_pairs]
+        # Define ideal bond lengths (in Angstroms)
+        # Values from Engh & Huber parameters
+        ideal_lengths = {
+            'N-CA': 1.46,
+            'CA-C': 1.52,
+            'C-O': 1.23,
+            'C-N+1': 1.33  # peptide bond
+        }
+        
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
+        
+        try:
+            # N-CA bonds
+            n_coords = bb_coords[:, 0]  # [L, 3]
+            ca_coords = bb_coords[:, 1]  # [L, 3]
+            n_ca_dists = torch.norm(ca_coords - n_coords, dim=1)  # [L]
+            n_ca_loss = torch.mean((n_ca_dists - ideal_lengths['N-CA'])**2)
             
-            # Evaluate fragment quality based on distance distribution
-            # In ideal secondary structures, these distances follow specific patterns
-            variance = torch.var(frag_distances, dim=1)  # [B]
+            # CA-C bonds
+            c_coords = bb_coords[:, 2]  # [L, 3]
+            ca_c_dists = torch.norm(c_coords - ca_coords, dim=1)  # [L]
+            ca_c_loss = torch.mean((ca_c_dists - ideal_lengths['CA-C'])**2)
             
-            # Higher variance = more disordered (lower score)
-            fragment_score = torch.exp(-5.0 * variance)
-            fragment_scores.append(fragment_score)
+            # C-O bonds
+            o_coords = bb_coords[:, 3]  # [L, 3]
+            c_o_dists = torch.norm(o_coords - c_coords, dim=1)  # [L]
+            c_o_loss = torch.mean((c_o_dists - ideal_lengths['C-O'])**2)
+            
+            # C-N+1 peptide bonds (except for last residue)
+            if L > 1:
+                c_n_dists = torch.norm(bb_coords[1:, 0] - bb_coords[:-1, 2], dim=1)  # [L-1]
+                c_n_loss = torch.mean((c_n_dists - ideal_lengths['C-N+1'])**2)
+            else:
+                c_n_loss = torch.tensor(0.0, device=device)
+            
+            # Combine all bond length losses
+            loss = n_ca_loss + ca_c_loss + c_o_loss + c_n_loss
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_bond_length_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
+
+    def _compute_bond_angle_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on deviation of bond angles from ideal values.
         
-        # Stack fragment scores
-        fragment_scores = torch.stack(fragment_scores, dim=1)  # [B, num_fragments]
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
+            
+        Returns:
+            Bond angle loss
+        """
+        if device is None:
+            device = bb_coords.device
+            
+        # Define ideal bond angles (in radians)
+        # Values from Engh & Huber parameters
+        ideal_angles = {
+            'N-CA-C': 111.0 * (torch.pi / 180.0),  # ~111 degrees
+            'CA-C-O': 120.5 * (torch.pi / 180.0),  # ~120.5 degrees
+            'CA-C-N+1': 116.2 * (torch.pi / 180.0),  # ~116.2 degrees
+            'O-C-N+1': 123.0 * (torch.pi / 180.0),  # ~123 degrees
+            'C-N+1-CA+1': 121.7 * (torch.pi / 180.0)  # ~121.7 degrees
+        }
         
-        # Compute global score using softmin to focus on worst fragments
-        temperature = 0.1
-        structure_score = -temperature * torch.logsumexp(-fragment_scores / temperature, dim=1)
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
         
-        return structure_score
+        try:
+            # Extract coordinates
+            n_coords = bb_coords[:, 0]   # [L, 3]
+            ca_coords = bb_coords[:, 1]  # [L, 3]
+            c_coords = bb_coords[:, 2]   # [L, 3]
+            o_coords = bb_coords[:, 3]   # [L, 3]
+            
+            # N-CA-C angles
+            v1 = n_coords - ca_coords   # N->CA vectors
+            v2 = c_coords - ca_coords   # CA->C vectors
+            
+            # Normalize vectors
+            v1_norm = torch.norm(v1, dim=1, keepdim=True)
+            v2_norm = torch.norm(v2, dim=1, keepdim=True)
+            
+            # Skip residues with zero-length vectors
+            mask = (v1_norm.squeeze(-1) > 1e-6) & (v2_norm.squeeze(-1) > 1e-6)
+            
+            if mask.sum() > 0:
+                v1_n = v1[mask] / v1_norm[mask]
+                v2_n = v2[mask] / v2_norm[mask]
+                
+                # Calculate cosine of angles
+                cos_angles = torch.sum(v1_n * v2_n, dim=1)
+                cos_angles = torch.clamp(cos_angles, -1.0 + 1e-6, 1.0 - 1e-6)
+                
+                # Calculate angles and difference from ideal
+                n_ca_c_angles = torch.acos(cos_angles)
+                n_ca_c_loss = torch.mean((n_ca_c_angles - ideal_angles['N-CA-C'])**2)
+            else:
+                n_ca_c_loss = torch.tensor(0.0, device=device)
+            
+            # CA-C-O angles (similar calculation)
+            v1 = ca_coords - c_coords   # CA->C vectors
+            v2 = o_coords - c_coords    # O->C vectors
+            
+            v1_norm = torch.norm(v1, dim=1, keepdim=True)
+            v2_norm = torch.norm(v2, dim=1, keepdim=True)
+            
+            mask = (v1_norm.squeeze(-1) > 1e-6) & (v2_norm.squeeze(-1) > 1e-6)
+            
+            if mask.sum() > 0:
+                v1_n = v1[mask] / v1_norm[mask]
+                v2_n = v2[mask] / v2_norm[mask]
+                
+                cos_angles = torch.sum(v1_n * v2_n, dim=1)
+                cos_angles = torch.clamp(cos_angles, -1.0 + 1e-6, 1.0 - 1e-6)
+                
+                ca_c_o_angles = torch.acos(cos_angles)
+                ca_c_o_loss = torch.mean((ca_c_o_angles - ideal_angles['CA-C-O'])**2)
+            else:
+                ca_c_o_loss = torch.tensor(0.0, device=device)
+            
+            # C-N+1-CA+1 angles (for peptide linkages)
+            peptide_angle_loss = torch.tensor(0.0, device=device)
+            
+            if L > 1:
+                # Calculate for each peptide bond (except last residue)
+                for i in range(L-1):
+                    try:
+                        v1 = c_coords[i] - n_coords[i+1]      # C->N+1 vector
+                        v2 = ca_coords[i+1] - n_coords[i+1]   # N+1->CA+1 vector
+                        
+                        v1_norm = torch.norm(v1)
+                        v2_norm = torch.norm(v2)
+                        
+                        if v1_norm > 1e-6 and v2_norm > 1e-6:
+                            v1_n = v1 / v1_norm
+                            v2_n = v2 / v2_norm
+                            
+                            cos_angle = torch.sum(v1_n * v2_n)
+                            cos_angle = torch.clamp(cos_angle, -1.0 + 1e-6, 1.0 - 1e-6)
+                            
+                            angle = torch.acos(cos_angle)
+                            peptide_angle_loss += (angle - ideal_angles['C-N+1-CA+1'])**2
+                    except Exception:
+                        continue
+                        
+                if L > 1:
+                    peptide_angle_loss = peptide_angle_loss / (L-1)
+            
+            # Combine all bond angle losses
+            loss = n_ca_c_loss + ca_c_o_loss + peptide_angle_loss
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_bond_angle_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
+
+    def _compute_ramachandran_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on Ramachandran plot statistics (phi/psi angle distributions).
+        
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
+            
+        Returns:
+            Ramachandran loss
+        """
+        if device is None:
+            device = bb_coords.device
+            
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
+        
+        try:
+            # Extract coordinates
+            n_coords = bb_coords[:, 0]   # [L, 3]
+            ca_coords = bb_coords[:, 1]  # [L, 3]
+            c_coords = bb_coords[:, 2]   # [L, 3]
+            
+            # Calculate phi/psi angles for each residue
+            # Phi: C(i-1)-N(i)-CA(i)-C(i)
+            # Psi: N(i)-CA(i)-C(i)-N(i+1)
+            
+            # Simplified Ramachandran validation: encourage angles to be in allowed regions
+            # Instead of full Ramachandran validation (which would require a database),
+            # we'll implement a simplified version that penalizes rare phi/psi combinations
+            
+            # Calculate phi angles (except first residue)
+            phi_loss = torch.tensor(0.0, device=device)
+            phi_count = 0
+            
+            if L > 1:
+                for i in range(1, L):
+                    try:
+                        # Calculate phi angle: C(i-1)-N(i)-CA(i)-C(i)
+                        if i > 0:
+                            v1 = c_coords[i-1] - n_coords[i]
+                            v2 = n_coords[i] - ca_coords[i]
+                            v3 = ca_coords[i] - c_coords[i]
+                            
+                            # Skip if any vector is too small
+                            if (torch.norm(v1) < 1e-6 or torch.norm(v2) < 1e-6 or torch.norm(v3) < 1e-6):
+                                continue
+                                
+                            # Use existing dihedral matrix computation if available
+                            # Otherwise calculate directly
+                            try:
+                                phi = self._compute_dihedral_matrix(
+                                    c_coords[i-1:i], n_coords[i:i+1], ca_coords[i:i+1], c_coords[i:i+1], device
+                                )[0, 0]
+                            except Exception:
+                                # Calculate normal vectors to the planes
+                                n1 = torch.cross(v1, v2)
+                                n2 = torch.cross(v2, v3)
+                                
+                                # Normalize
+                                n1 = n1 / (torch.norm(n1) + 1e-8)
+                                n2 = n2 / (torch.norm(n2) + 1e-8)
+                                
+                                # Compute dihedral angle
+                                cos_phi = torch.sum(n1 * n2)
+                                cos_phi = torch.clamp(cos_phi, -1.0 + 1e-6, 1.0 - 1e-6)
+                                
+                                # Determine sign: sign of (n1 × n2)·v2
+                                v2_norm = v2 / (torch.norm(v2) + 1e-8)
+                                sign = torch.sign(torch.sum(torch.cross(n1, n2) * v2_norm))
+                                
+                                phi = sign * torch.acos(cos_phi)
+                            
+                            # Penalize rare phi angles 
+                            # Most common phi angles are around -60 degrees (-π/3 radians)
+                            phi_target = -torch.pi/3
+                            
+                            # Create a periodic loss function with minima at the target
+                            phi_deviation = torch.min(
+                                torch.abs(phi - phi_target),
+                                2*torch.pi - torch.abs(phi - phi_target)
+                            )
+                            
+                            # Apply a soft constraint (allow some deviation)
+                            phi_tolerance = torch.pi/3  # 60 degrees tolerance
+                            phi_penalty = torch.relu(phi_deviation - phi_tolerance)
+                            
+                            phi_loss += phi_penalty**2
+                            phi_count += 1
+                    except Exception:
+                        continue
+                    
+            # Calculate psi angles (except last residue)
+            psi_loss = torch.tensor(0.0, device=device)
+            psi_count = 0
+            
+            if L > 1:
+                for i in range(L-1):
+                    try:
+                        # Calculate psi angle: N(i)-CA(i)-C(i)-N(i+1)
+                        v1 = n_coords[i] - ca_coords[i]
+                        v2 = ca_coords[i] - c_coords[i]
+                        v3 = c_coords[i] - n_coords[i+1]
+                        
+                        # Skip if any vector is too small
+                        if (torch.norm(v1) < 1e-6 or torch.norm(v2) < 1e-6 or torch.norm(v3) < 1e-6):
+                            continue
+                            
+                        # Use existing dihedral matrix computation if available
+                        # Otherwise calculate directly
+                        try:
+                            psi = self._compute_dihedral_matrix(
+                                n_coords[i:i+1], ca_coords[i:i+1], c_coords[i:i+1], n_coords[i+1:i+2], device
+                            )[0, 0]
+                        except Exception:
+                            # Calculate normal vectors to the planes
+                            n1 = torch.cross(v1, v2)
+                            n2 = torch.cross(v2, v3)
+                            
+                            # Normalize
+                            n1 = n1 / (torch.norm(n1) + 1e-8)
+                            n2 = n2 / (torch.norm(n2) + 1e-8)
+                            
+                            # Compute dihedral angle
+                            cos_psi = torch.sum(n1 * n2)
+                            cos_psi = torch.clamp(cos_psi, -1.0 + 1e-6, 1.0 - 1e-6)
+                            
+                            # Determine sign
+                            v2_norm = v2 / (torch.norm(v2) + 1e-8)
+                            sign = torch.sign(torch.sum(torch.cross(n1, n2) * v2_norm))
+                            
+                            psi = sign * torch.acos(cos_psi)
+                        
+                        # Penalize rare psi angles
+                        # Most common psi angles are around +40 degrees (π/4.5 radians)
+                        psi_target = torch.pi/4.5
+                        
+                        # Create a periodic loss function with minima at the target
+                        psi_deviation = torch.min(
+                            torch.abs(psi - psi_target),
+                            2*torch.pi - torch.abs(psi - psi_target)
+                        )
+                        
+                        # Apply a soft constraint (allow some deviation)
+                        psi_tolerance = torch.pi/3  # 60 degrees tolerance
+                        psi_penalty = torch.relu(psi_deviation - psi_tolerance)
+                        
+                        psi_loss += psi_penalty**2
+                        psi_count += 1
+                    except Exception:
+                        continue
+                        
+            # Combine phi and psi losses
+            if phi_count > 0:
+                phi_loss = phi_loss / phi_count
+                
+            if psi_count > 0:
+                psi_loss = psi_loss / psi_count
+                
+            loss = phi_loss + psi_loss
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_ramachandran_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
+
+    def _compute_nonbonded_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on non-bonded interactions (clashes and contacts).
+        
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
+            
+        Returns:
+            Non-bonded interaction loss
+        """
+        if device is None:
+            device = bb_coords.device
+            
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
+        
+        try:
+            # Calculate pairwise distances between all atoms
+            # Reshape to [L*4, 3]
+            all_atoms = bb_coords.reshape(-1, 3)
+            
+            # Calculate pairwise distances [L*4, L*4]
+            dists = torch.cdist(all_atoms, all_atoms)
+            
+            # Create a mask for excluding bonded interactions
+            # We'll exclude distances between atoms in the same residue and
+            # adjacent residues for simplicity
+            mask = torch.ones_like(dists, dtype=torch.bool)
+            
+            # Mask diagonal (self-interactions)
+            mask.fill_diagonal_(False)
+            
+            # Mask interactions within same residue and adjacent residues
+            for i in range(L):
+                # Within same residue
+                start_i = i * 4
+                end_i = start_i + 4
+                mask[start_i:end_i, start_i:end_i] = False
+                
+                # With adjacent residues
+                if i > 0:
+                    prev_start = (i-1) * 4
+                    prev_end = prev_start + 4
+                    mask[start_i:end_i, prev_start:prev_end] = False
+                    mask[prev_start:prev_end, start_i:end_i] = False
+                    
+            # Extract non-bonded distances
+            nonbonded_dists = dists[mask]
+            
+            # Define distance thresholds for clashes and contacts
+            clash_threshold = 1.5  # Angstroms (severe clash)
+            min_nonbonded_dist = 2.0  # Angstroms (minimum allowed distance)
+            
+            # Calculate clash penalty
+            # Penalize distances below min_nonbonded_dist
+            clash_mask = nonbonded_dists < min_nonbonded_dist
+            if clash_mask.sum() > 0:
+                clash_penalty = torch.mean((min_nonbonded_dist - nonbonded_dists[clash_mask])**2)
+            else:
+                clash_penalty = torch.tensor(0.0, device=device)
+                
+            # Severe clash penalty
+            severe_clash_mask = nonbonded_dists < clash_threshold
+            if severe_clash_mask.sum() > 0:
+                severe_clash_penalty = 10.0 * torch.mean((clash_threshold - nonbonded_dists[severe_clash_mask])**2)
+            else:
+                severe_clash_penalty = torch.tensor(0.0, device=device)
+                
+            # Combine penalties
+            loss = clash_penalty + severe_clash_penalty
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_nonbonded_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
+
+    def _compute_ca_distance_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on CA-CA distance distributions compared to known proteins.
+        
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
+            
+        Returns:
+            CA-CA distance profile loss
+        """
+        if device is None:
+            device = bb_coords.device
+            
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
+        
+        try:
+            # Extract CA coordinates
+            ca_coords = bb_coords[:, 1]  # [L, 3]
+            
+            # Calculate all pairwise CA-CA distances
+            ca_dists = torch.cdist(ca_coords, ca_coords)
+            
+            # Create a sequence separation mask to analyze distances by sequence separation
+            seq_sep = torch.abs(torch.arange(L, device=device).unsqueeze(0) - 
+                            torch.arange(L, device=device).unsqueeze(1))
+            
+            # Define expected CA-CA distance ranges based on sequence separation
+            # These values represent typical ranges seen in protein structures
+            
+            # Adjacent residues (i, i+1)
+            sep1_mask = seq_sep == 1
+            sep1_dists = ca_dists[sep1_mask]
+            if len(sep1_dists) > 0:
+                # Adjacent CA-CA distances should be ~3.8Å
+                sep1_loss = torch.mean((sep1_dists - 3.8)**2)
+            else:
+                sep1_loss = torch.tensor(0.0, device=device)
+                
+            # Residues separated by 2 (i, i+2)
+            sep2_mask = seq_sep == 2
+            sep2_dists = ca_dists[sep2_mask]
+            if len(sep2_dists) > 0:
+                # For separation 2, distances depend on secondary structure
+                # Allow either extended (~7.4Å) or helical (~5.5Å)
+                ext_dev = (sep2_dists - 7.4)**2
+                hel_dev = (sep2_dists - 5.5)**2
+                sep2_loss = torch.mean(torch.min(ext_dev, hel_dev))  # Encourage either structure
+            else:
+                sep2_loss = torch.tensor(0.0, device=device)
+                
+            # Residues separated by 3 (i, i+3)
+            sep3_mask = seq_sep == 3
+            sep3_dists = ca_dists[sep3_mask]
+            if len(sep3_dists) > 0:
+                # For separation 3, helix is ~5.45Å, extended ~10.5Å
+                ext_dev = (sep3_dists - 10.5)**2
+                hel_dev = (sep3_dists - 5.45)**2
+                sep3_loss = torch.mean(torch.min(ext_dev, hel_dev))
+            else:
+                sep3_loss = torch.tensor(0.0, device=device)
+                
+            # Residues separated by 4 (i, i+4) - important for helices
+            sep4_mask = seq_sep == 4
+            sep4_dists = ca_dists[sep4_mask]
+            if len(sep4_dists) > 0:
+                # For separation 4, helix is ~6.3Å, extended ~13Å
+                ext_dev = (sep4_dists - 13.0)**2
+                hel_dev = (sep4_dists - 6.3)**2
+                sep4_loss = torch.mean(torch.min(ext_dev, hel_dev))
+            else:
+                sep4_loss = torch.tensor(0.0, device=device)
+            
+            # Combine losses with appropriate weights
+            loss = sep1_loss + 0.7*sep2_loss + 0.7*sep3_loss + 0.7*sep4_loss
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_ca_distance_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
+    
+    def _compute_backbone_regularity_loss(self, bb_coords, device=None):
+        """
+        Compute loss based on backbone regularity metrics like peptide planarity
+        and omega angles.
+        
+        Args:
+            bb_coords: Backbone coordinates [L, 4, 3]
+            device: Target device
+            
+        Returns:
+            Backbone regularity loss
+        """
+        if device is None:
+            device = bb_coords.device
+            
+        L = bb_coords.shape[0]
+        loss = torch.tensor(0.0, device=device)
+        
+        try:
+            # Extract backbone atoms
+            n_coords = bb_coords[:, 0]   # [L, 3]
+            ca_coords = bb_coords[:, 1]  # [L, 3]
+            c_coords = bb_coords[:, 2]   # [L, 3]
+            
+            # 1. Planarity of peptide bonds
+            planarity_loss = torch.tensor(0.0, device=device)
+            planarity_count = 0
+            
+            if L > 1:
+                for i in range(L-1):
+                    try:
+                        # For each peptide bond, check the planarity of 4 consecutive atoms
+                        # C(i), O(i), N(i+1), CA(i+1) should be approximately planar
+                        
+                        c_i = c_coords[i]
+                        o_i = bb_coords[i, 3]  # O atom
+                        n_ip1 = n_coords[i+1]  # N of next residue
+                        ca_ip1 = ca_coords[i+1]  # CA of next residue
+                        
+                        # Calculate vectors
+                        v1 = o_i - c_i
+                        v2 = n_ip1 - c_i
+                        v3 = ca_ip1 - n_ip1
+                        
+                        # Skip if any vector is too small
+                        if (torch.norm(v1) < 1e-6 or torch.norm(v2) < 1e-6 or torch.norm(v3) < 1e-6):
+                            continue
+                        
+                        # Calculate normal vector to the plane defined by C-O and C-N
+                        normal = torch.cross(v1, v2)
+                        normal = normal / (torch.norm(normal) + 1e-8)
+                        
+                        # Calculate projection of CA-N onto this normal
+                        projection = torch.abs(torch.dot(v3, normal))
+                        
+                        # In a perfectly planar arrangement, projection would be 0
+                        planarity_loss += projection**2
+                        planarity_count += 1
+                    except Exception:
+                        continue
+                        
+            if planarity_count > 0:
+                planarity_loss = planarity_loss / planarity_count
+                
+            # 2. Omega angles (should be close to 180 degrees)
+            omega_loss = torch.tensor(0.0, device=device)
+            omega_count = 0
+            
+            if L > 1:
+                for i in range(L-1):
+                    try:
+                        # Calculate omega angle: CA(i)-C(i)-N(i+1)-CA(i+1)
+                        v1 = ca_coords[i] - c_coords[i]
+                        v2 = c_coords[i] - n_coords[i+1]
+                        v3 = n_coords[i+1] - ca_coords[i+1]
+                        
+                        # Skip if any vector is too small
+                        if (torch.norm(v1) < 1e-6 or torch.norm(v2) < 1e-6 or torch.norm(v3) < 1e-6):
+                            continue
+                        
+                        # Use existing dihedral matrix computation if available
+                        try:
+                            omega = self._compute_dihedral_matrix(
+                                ca_coords[i:i+1], c_coords[i:i+1], n_coords[i+1:i+2], ca_coords[i+1:i+2], device
+                            )[0, 0]
+                        except Exception:
+                            # Calculate normal vectors to the planes
+                            n1 = torch.cross(v1, v2)
+                            n2 = torch.cross(v2, v3)
+                            
+                            # Normalize
+                            n1 = n1 / (torch.norm(n1) + 1e-8)
+                            n2 = n2 / (torch.norm(n2) + 1e-8)
+                            
+                            # Compute dihedral angle
+                            cos_omega = torch.sum(n1 * n2)
+                            cos_omega = torch.clamp(cos_omega, -1.0 + 1e-6, 1.0 - 1e-6)
+                            
+                            # Determine sign
+                            v2_norm = v2 / (torch.norm(v2) + 1e-8)
+                            sign = torch.sign(torch.sum(torch.cross(n1, n2) * v2_norm))
+                            
+                            omega = sign * torch.acos(cos_omega)
+                        
+                        # Convert to range [-π, π]
+                        if omega > torch.pi:
+                            omega = omega - 2 * torch.pi
+                            
+                        # Omega should be close to ±180° (±π radians)
+                        # Penalize deviation from planarity
+                        omega_dev = torch.min(
+                            torch.abs(omega - torch.pi),
+                            torch.abs(omega + torch.pi)
+                        )
+                        
+                        # Square penalty for significant deviations
+                        omega_loss += omega_dev**2
+                        omega_count += 1
+                    except Exception:
+                        continue
+                        
+            if omega_count > 0:
+                omega_loss = omega_loss / omega_count
+            
+            # Combine all losses with appropriate weights
+            loss = planarity_loss + 2.0 * omega_loss  # Higher weight for omega angles
+            
+        except Exception as e:
+            self._log.warning(f"Error in _compute_backbone_regularity_loss: {e}")
+            # Return a default loss to ensure gradients
+            loss = torch.tensor(1.0, device=device, requires_grad=True)
+            
+        return loss
