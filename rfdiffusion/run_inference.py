@@ -18,6 +18,7 @@ import numpy as np
 import random
 import glob
 import importlib.resources as pkg_resources
+import uuid
 
 def make_deterministic(seed=0):
     torch.manual_seed(seed)
@@ -72,7 +73,7 @@ def run_inference(
             make_deterministic(i_des)
 
         start_time = time.time()
-        out_prefix = f"{sampler.inf_conf.output_prefix}_{i_des}"
+        out_prefix = f"{sampler.inf_conf.output_prefix}u{uuid.uuid4()}"
         log.info(f"Making design {out_prefix}")
         if cautious and os.path.exists(out_prefix + ".pdb"):
             log.info(
